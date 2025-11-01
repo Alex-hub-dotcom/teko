@@ -1,9 +1,10 @@
+############ ENV - Multi-Environment Compatible (FIXED v2)
 # SPDX-License-Identifier: BSD-3-Clause
 """
-TEKO Environment — Isaac Lab 0.47.1 / Isaac Sim 5.0
----------------------------------------------------
+TEKO Environment — Isaac Lab 0.47.1 (Multi-Environment Support)
+----------------------------------------------------------------
 Active TEKO robot (RL agent) + static RobotGoal with emissive ArUco marker.
-Suporta múltiplos ambientes paralelos e fallback automático GPU→CPU.
+Scales from 1 to 100+ parallel environments.
 """
 
 from __future__ import annotations
@@ -23,33 +24,16 @@ from .robots.teko import TEKO_CONFIGURATION
 
 
 class TekoEnv(DirectRLEnv):
-    """TEKO environment: 1 robô ativo + 1 alvo estático com marcador ArUco."""
+    """TEKO environment: Multiple parallel robots + static goals with ArUco."""
 
     cfg: TekoEnvCfg
 
     def __init__(self, cfg: TekoEnvCfg, render_mode: str | None = None, **kwargs):
-        # --- Configura PhysX (GPU se possível) ---
-        try:
-            sim = SimulationContext.instance()
-            if cfg.use_gpu_physics:
-                sim.enable_gpu_dynamics(True)
-                print("[INFO] PhysX GPU habilitado (modo rápido).")
-            else:
-                sim.enable_gpu_dynamics(False)
-                print("[INFO] PhysX CPU forçado por configuração.")
-        except Exception as e:
-            print(f"[WARN] Falha ao configurar PhysX GPU ({e}); usando CPU fallback.")
-            try:
-                sim.enable_gpu_dynamics(False)
-            except Exception:
-                pass
-
-        # --- Inicialização padrão ---
         self._cam_res = (cfg.camera.width, cfg.camera.height)
         self._max_wheel_speed = cfg.max_wheel_speed
         self.actions = None
         self.dof_idx = None
-        self.camera = None
+        self.cameras = []  # One camera per environment
         super().__init__(cfg, render_mode, **kwargs)
 
     # ------------------------------------------------------------------
@@ -60,53 +44,92 @@ class TekoEnv(DirectRLEnv):
         if stage is None:
             raise RuntimeError("USD stage not initialized")
 
-        env0_path = self.scene.env_prim_paths[0]
+        # --- Global lighting (shared across all environments) ---
+        self._setup_global_lighting(stage)
 
-        # --- Arena ---
-        try:
-            arena_path = "/workspace/teko/documents/CAD/USD/stage_arena.usd"
-            arena_prim = stage.DefinePrim(f"{env0_path}/StageArena", "Xform")
-            arena_prim.GetReferences().AddReference(arena_path)
-        except Exception:
-            spawn_ground_plane(prim_path=f"{env0_path}/ground", cfg=GroundPlaneCfg())
+        # --- Active robot - use scene config ---
+        self.robot = Articulation(self.cfg.robot_cfg)
+        self.scene.articulations["robot"] = self.robot
 
-        # --- Luz ambiente + sol ---
-        ambient = UsdLux.DomeLight.Define(stage, Sdf.Path(f"{env0_path}/AmbientLight"))
+        # --- Clone environments ---
+        self.scene.clone_environments(copy_from_source=False)
+        
+        # --- Spawn per-environment assets AFTER cloning ---
+        self._setup_per_environment_assets(stage)
+
+        # --- Setup cameras ---
+        self._setup_cameras()
+
+    def _setup_global_lighting(self, stage):
+        """Setup global lighting (dome + sun) - shared across all envs."""
+        # Remove default blue dome
+        if stage.GetPrimAtPath("/World/DomeLight"):
+            stage.RemovePrim("/World/DomeLight")
+
+        # Ambient dome light
+        ambient = UsdLux.DomeLight.Define(stage, Sdf.Path("/World/AmbientLight"))
         ambient.CreateIntensityAttr(4000.0)
         ambient.CreateColorAttr(Gf.Vec3f(0.95, 0.95, 0.95))
+        ambient.CreateTextureFileAttr("")
 
-        sun = UsdLux.DistantLight.Define(stage, Sdf.Path(f"{env0_path}/SunLight"))
+        # Directional sun light
+        sun = UsdLux.DistantLight.Define(stage, Sdf.Path("/World/SunLight"))
         sun.CreateIntensityAttr(2000.0)
         sun.CreateColorAttr(Gf.Vec3f(1.0, 0.98, 0.95))
         UsdGeom.Xformable(sun).AddRotateXOp().Set(-50.0)
         UsdGeom.Xformable(sun).AddRotateYOp().Set(30.0)
-        print("[INFO] Luz ambiente neutra + sol direcional aplicados (sem HDRI).")
 
-        # --- Robô ativo ---
-        self.robot = Articulation(TEKO_CONFIGURATION.replace(prim_path=f"{env0_path}/Robot"))
-        self.scene.articulations["robot"] = self.robot
-        robot_prim = stage.GetPrimAtPath(f"{env0_path}/Robot")
-        xf_robot = UsdGeom.Xformable(robot_prim)
-        xf_robot.ClearXformOpOrder()
-        xf_robot.AddTranslateOp().Set(Gf.Vec3d(-0.2, 0.0, 0.43))
-        xf_robot.AddRotateZOp().Set(180.0)
+        print("[INFO] Global lighting setup complete.")
 
-        # --- Robô alvo estático ---
+    def _setup_per_environment_assets(self, stage):
+        """Spawn arena, goal robot + ArUco marker for EACH environment."""
+        num_envs = self.scene.cfg.num_envs
+        
+        ARENA_USD_PATH = "/workspace/teko/documents/CAD/USD/stage_arena.usd"
         TEKO_USD_PATH = "/workspace/teko/documents/CAD/USD/teko_goal.usd"
         ARUCO_IMG_PATH = "/workspace/teko/documents/Aruco/test_marker.png"
-        ROBOT_GOAL_PATH = f"{env0_path}/RobotGoal"
 
-        robot_goal = stage.DefinePrim(ROBOT_GOAL_PATH, "Xform")
-        robot_goal.GetReferences().AddReference(TEKO_USD_PATH)
-        xf_goal = UsdGeom.Xformable(robot_goal)
-        xf_goal.AddTranslateOp().Set(Gf.Vec3f(1.0, 0.0, 0.40))
-        xf_goal.AddRotateZOp().Set(180.0)
+        for env_idx in range(num_envs):
+            env_path = f"/World/envs/env_{env_idx}"
+            
+            # Arena per environment
+            try:
+                arena_prim = stage.DefinePrim(f"{env_path}/Arena", "Xform")
+                arena_prim.GetReferences().AddReference(ARENA_USD_PATH)
+            except Exception as e:
+                print(f"[WARN] Arena failed for env_{env_idx}: {e}")
+            
+            # Position active robot
+            robot_prim = stage.GetPrimAtPath(f"{env_path}/Robot")
+            if robot_prim.IsValid():
+                xf_robot = UsdGeom.Xformable(robot_prim)
+                xf_robot.ClearXformOpOrder()
+                xf_robot.AddTranslateOp().Set(Gf.Vec3d(-0.2, 0.0, 0.43))
+                xf_robot.AddRotateZOp().Set(180.0)
 
-        # --- Placa ArUco ---
+            # Goal robot
+            goal_path = f"{env_path}/RobotGoal"
+            robot_goal = stage.DefinePrim(goal_path, "Xform")
+            robot_goal.GetReferences().AddReference(TEKO_USD_PATH)
+            
+            xf_goal = UsdGeom.Xformable(robot_goal)
+            xf_goal.ClearXformOpOrder()
+            xf_goal.AddTranslateOp().Set(Gf.Vec3f(1.0, 0.0, 0.40))
+            xf_goal.AddRotateZOp().Set(180.0)
+
+            # ArUco marker
+            self._create_aruco_marker(stage, goal_path, ARUCO_IMG_PATH)
+
+        print(f"[INFO] Created {num_envs} environments with arenas, robots, and ArUco markers.")
+
+    def _create_aruco_marker(self, stage, goal_path: str, aruco_img_path: str):
+        """Create ArUco marker mesh with texture for a specific goal robot."""
         size = 0.05
         half = size * 0.5
-        ARUCO_PRIM_PATH = f"{ROBOT_GOAL_PATH}/Aruco"
-        mesh = UsdGeom.Mesh.Define(stage, ARUCO_PRIM_PATH)
+        aruco_prim_path = f"{goal_path}/Aruco"
+
+        # Mesh geometry
+        mesh = UsdGeom.Mesh.Define(stage, aruco_prim_path)
         mesh.CreatePointsAttr([
             Gf.Vec3f(0.0, -half, -half),
             Gf.Vec3f(0.0,  half, -half),
@@ -116,143 +139,160 @@ class TekoEnv(DirectRLEnv):
         mesh.CreateFaceVertexCountsAttr([3, 3])
         mesh.CreateFaceVertexIndicesAttr([0, 1, 2, 0, 2, 3])
         mesh.CreateDoubleSidedAttr(True)
-        UsdGeom.Xformable(mesh).AddTranslateOp().Set(Gf.Vec3f(0.17, 0.0, -0.045))
 
+        # Position
+        xf_aruco = UsdGeom.Xformable(mesh)
+        xf_aruco.ClearXformOpOrder()
+        xf_aruco.AddTranslateOp().Set(Gf.Vec3f(0.17, 0.0, -0.045))
+
+        # UV coordinates
         primvars_api = UsdGeom.PrimvarsAPI(mesh)
         primvars_api.CreatePrimvar(
             "st", Sdf.ValueTypeNames.TexCoord2fArray, UsdGeom.Tokens.vertex
         ).Set([
-            Gf.Vec2f(0.0, 0.0),
-            Gf.Vec2f(1.0, 0.0),
-            Gf.Vec2f(1.0, 1.0),
-            Gf.Vec2f(0.0, 1.0)
+            Gf.Vec2f(0.0, 0.0), Gf.Vec2f(1.0, 0.0),
+            Gf.Vec2f(1.0, 1.0), Gf.Vec2f(0.0, 1.0)
         ])
 
-        # --- Material emissivo (Aruco) ---
-        LOOKS_PATH = f"{ROBOT_GOAL_PATH}/Looks/ArucoMaterial"
-        material = UsdShade.Material.Define(stage, LOOKS_PATH)
-        tex = UsdShade.Shader.Define(stage, LOOKS_PATH + "/Texture")
+        # Material with texture
+        looks_path = f"{goal_path}/Looks/ArucoMaterial"
+        material = UsdShade.Material.Define(stage, looks_path)
+
+        tex = UsdShade.Shader.Define(stage, looks_path + "/Texture")
         tex.CreateIdAttr("UsdUVTexture")
-        tex.CreateInput("file", Sdf.ValueTypeNames.Asset).Set(Sdf.AssetPath(ARUCO_IMG_PATH))
+        tex.CreateInput("file", Sdf.ValueTypeNames.Asset).Set(Sdf.AssetPath(aruco_img_path))
         tex.CreateInput("wrapS", Sdf.ValueTypeNames.Token).Set("clamp")
         tex.CreateInput("wrapT", Sdf.ValueTypeNames.Token).Set("clamp")
-        st_reader = UsdShade.Shader.Define(stage, LOOKS_PATH + "/stReader")
+
+        st_reader = UsdShade.Shader.Define(stage, looks_path + "/stReader")
         st_reader.CreateIdAttr("UsdPrimvarReader_float2")
         st_reader.CreateInput("varname", Sdf.ValueTypeNames.Token).Set("st")
         st_reader_output = st_reader.CreateOutput("result", Sdf.ValueTypeNames.Float2)
         tex.CreateInput("st", Sdf.ValueTypeNames.Float2).ConnectToSource(st_reader_output)
+
         tex_out = tex.CreateOutput("rgb", Sdf.ValueTypeNames.Float3)
-        shader = UsdShade.Shader.Define(stage, LOOKS_PATH + "/Shader")
+
+        shader = UsdShade.Shader.Define(stage, looks_path + "/Shader")
         shader.CreateIdAttr("UsdPreviewSurface")
         shader.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(0.0)
         shader.CreateInput("metallic", Sdf.ValueTypeNames.Float).Set(0.0)
         shader.CreateInput("opacity", Sdf.ValueTypeNames.Float).Set(1.0)
         shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).ConnectToSource(tex_out)
         shader.CreateInput("emissiveColor", Sdf.ValueTypeNames.Color3f).ConnectToSource(tex_out)
+
         shader_output = shader.CreateOutput("surface", Sdf.ValueTypeNames.Token)
         material.CreateSurfaceOutput().ConnectToSource(shader_output)
         UsdShade.MaterialBindingAPI(mesh).Bind(material)
-        print("[INFO] ArUco material difuso aplicado com sucesso (multi-env).")
 
-        # --- Clona ambientes ---
-        self.scene.clone_environments(copy_from_source=False)
-
-        # --- Câmera ---
+    def _setup_cameras(self):
+        """Initialize one camera per environment."""
         sim = SimulationContext.instance()
-        cam_path = self.cfg.camera.prim_path
-        cam_prim = sim.stage.GetPrimAtPath(f"{env0_path}{cam_path}")
-        if not cam_prim.IsValid():
-            raise RuntimeError(f"[ERROR] Camera prim not found at {env0_path}{cam_path}")
-        print(f"[INFO] Using active robot camera at {env0_path}{cam_path}")
-        self.camera = Camera(
-            prim_path=f"{env0_path}{cam_path}",
-            resolution=self._cam_res,
-            frequency=self.cfg.camera.frequency_hz,
-        )
-        self.camera.initialize()
+        num_envs = self.scene.cfg.num_envs
+
+        for env_idx in range(num_envs):
+            cam_path = f"/World/envs/env_{env_idx}/Robot/teko_urdf/TEKO_Body/TEKO_WallBack/TEKO_Camera/RearCamera"
+            
+            cam_prim = sim.stage.GetPrimAtPath(cam_path)
+            if not cam_prim.IsValid():
+                print(f"[WARN] Camera not found at {cam_path}")
+                continue
+
+            camera = Camera(
+                prim_path=cam_path,
+                resolution=self._cam_res,
+                frequency=self.cfg.camera.frequency_hz,
+            )
+            camera.initialize()
+            self.cameras.append(camera)
+
+        print(f"[INFO] Initialized {len(self.cameras)} cameras.")
 
     # ------------------------------------------------------------------
     # Física / Observações / Ações
     # ------------------------------------------------------------------
     def _lazy_init_articulation(self):
+        """Initialize joint indices once the articulation is ready."""
         if self.dof_idx is not None or getattr(self.robot, "root_physx_view", None) is None:
             return
+        
+        # Find indices for the wheel joints
         name_to_idx = {n: i for i, n in enumerate(self.robot.joint_names)}
-        self.dof_idx = torch.tensor(
-            [name_to_idx[n] for n in self.cfg.dof_names if n in name_to_idx],
-            dtype=torch.long, device=self.device)
+        indices = []
+        for dof_name in self.cfg.dof_names:
+            if dof_name in name_to_idx:
+                indices.append(name_to_idx[dof_name])
+            else:
+                print(f"[WARN] Joint '{dof_name}' not found. Available: {self.robot.joint_names}")
+        
+        if len(indices) == 0:
+            raise RuntimeError(f"No valid DOF names found! Available: {self.robot.joint_names}")
+        
+        self.dof_idx = torch.tensor(indices, dtype=torch.long, device=self.device)
+        print(f"[INFO] DOF indices: {self.dof_idx}")
 
     def _pre_physics_step(self, actions: torch.Tensor):
+        """Store actions before physics step."""
         self.actions = actions
         self._lazy_init_articulation()
 
     def _apply_action(self):
-        if self.dof_idx is None:
+        """Apply wheel velocities to all environments."""
+        if self.dof_idx is None or self.actions is None:
             return
-        left, right = self.actions[0]
-        targets = torch.tensor([left, right, left, right],
-                               device=self.device).unsqueeze(0) * self._max_wheel_speed
-        polarity = torch.tensor(self.cfg.wheel_polarity,
-                                device=self.device).unsqueeze(0)
-        num_envs = self.scene.num_envs
+
+        num_envs = self.scene.cfg.num_envs
+        
+        # actions shape: (num_envs, 2) -> [left_vel, right_vel] per env
+        left_vel = self.actions[:, 0]
+        right_vel = self.actions[:, 1]
+
+        # Expand to 4 wheels: [front_left, front_right, back_left, back_right]
+        targets = torch.stack([left_vel, right_vel, left_vel, right_vel], dim=1) * self._max_wheel_speed
+        
+        # Apply wheel polarity
+        polarity = torch.tensor(self.cfg.wheel_polarity, device=self.device).unsqueeze(0)
+        targets = targets * polarity
+
+        # Apply to all environments
         env_ids = torch.arange(num_envs, device=self.device)
-        self.robot.set_joint_velocity_target(
-            targets.repeat(num_envs, 1) * polarity,
-            env_ids=env_ids,
-            joint_ids=self.dof_idx)
+        self.robot.set_joint_velocity_target(targets, env_ids=env_ids, joint_ids=self.dof_idx)
 
     def _get_observations(self):
-        obs = {}
-        try:
-            rgba = self.camera.get_rgba()
-            if isinstance(rgba, np.ndarray) and rgba.size > 0:
-                rgb = (torch.from_numpy(rgba[..., :3])
-                       .to(self.device)
-                       .permute(2, 0, 1)
-                       .unsqueeze(0)
-                       .float() / 255.0)
-                obs["rgb"] = rgb
-            else:
-                h, w = self._cam_res[1], self._cam_res[0]
-                obs["rgb"] = torch.zeros((1, 3, h, w), device=self.device)
-        except Exception:
-            h, w = self._cam_res[1], self._cam_res[0]
-            obs["rgb"] = torch.zeros((1, 3, h, w), device=self.device)
+        """Get RGB observations from all cameras."""
+        num_envs = self.scene.cfg.num_envs
+        h, w = self._cam_res[1], self._cam_res[0]
+        
+        obs = {"rgb": torch.zeros((num_envs, 3, h, w), device=self.device)}
+
+        for env_idx, camera in enumerate(self.cameras):
+            if env_idx >= num_envs:
+                break
+                
+            try:
+                rgba = camera.get_rgba()
+                if isinstance(rgba, np.ndarray) and rgba.size > 0:
+                    rgb = (torch.from_numpy(rgba[..., :3])
+                           .to(self.device)
+                           .permute(2, 0, 1)
+                           .float() / 255.0)
+                    obs["rgb"][env_idx] = rgb
+            except Exception as e:
+                print(f"[WARN] Camera {env_idx} failed: {e}")
+                continue
+
         return obs
 
     def _get_rewards(self):
-        return torch.zeros(1, device=self.device)
+        """Placeholder rewards (implement your docking reward logic here)."""
+        return torch.zeros(self.scene.cfg.num_envs, device=self.device)
 
     def _get_dones(self):
-        done = torch.zeros(1, dtype=torch.bool, device=self.device)
+        """Placeholder termination logic."""
+        num_envs = self.scene.cfg.num_envs
+        done = torch.zeros(num_envs, dtype=torch.bool, device=self.device)
         return done, done
 
     def _reset_idx(self, env_ids):
+        """Reset specific environments."""
         super()._reset_idx(env_ids)
         self._lazy_init_articulation()
-        self.actions = torch.zeros((self.scene.num_envs, 2), device=self.device)
-
-    def reset(self):
-        """Reset seguro multi-env sem crash CUDA."""
-        num_envs = self.scene.num_envs
-        self._lazy_init_articulation()
-        self.actions = torch.zeros((num_envs, 2), device=self.device)
-        return self._get_observations()
-
-    # ------------------------------------------------------------------
-    # Step estável (Ignora Fabric bug e faz fallback GPU→CPU)
-    # ------------------------------------------------------------------
-    def step(self, actions: torch.Tensor):
-        try:
-            self._pre_physics_step(actions)
-            self._apply_action()
-            self.sim.step(render=True)
-        except RuntimeError as e:
-            if "device-side assert" in str(e) or "GPU solveBlockUnified" in str(e):
-                print("[WARN] Crash PhysX GPU detectado! Alternando para CPU...")
-                sim = SimulationContext.instance()
-                sim.enable_gpu_dynamics(False)
-                self.sim.step(render=True)
-            else:
-                raise e
-        return self._get_observations()
