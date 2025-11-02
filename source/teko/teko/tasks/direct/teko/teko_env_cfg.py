@@ -36,7 +36,7 @@ class TekoEnvCfg(DirectRLEnvCfg):
 
     # --- Scene configuration ------------------------------------------
     scene: InteractiveSceneCfg = InteractiveSceneCfg(
-        num_envs=256, 
+        num_envs=1, 
         env_spacing=6.0,
         replicate_physics=True,
     )
