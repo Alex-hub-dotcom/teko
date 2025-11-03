@@ -1,10 +1,11 @@
-############ ENV - Multi-Environment Compatible with Rewards (v3)
+############ ENV - Multi-Environment Compatible (FIXED v3 - with Goal Caching)
 # SPDX-License-Identifier: BSD-3-Clause
 """
-TEKO Environment — Isaac Lab 0.47.1 (Multi-Environment Support + RL Ready)
----------------------------------------------------------------------------
+TEKO Environment — Isaac Lab 0.47.1 (Multi-Environment Support)
+----------------------------------------------------------------
 Active TEKO robot (RL agent) + static RobotGoal with emissive ArUco marker.
-Includes reward computation and episode termination logic.
+Scales from 1 to 100+ parallel environments.
+Now with goal position caching for reward calculation.
 """
 
 from __future__ import annotations
@@ -34,16 +35,8 @@ class TekoEnv(DirectRLEnv):
         self.actions = None
         self.dof_idx = None
         self.cameras = []  # One camera per environment
-        
-        # Docking parameters
-        self.target_distance = 0.475  # 47.5cm
-        self.tolerance = 0.01  # 1cm
-        self.max_distance = 3.0  # Max distance before episode fails
-        
-        # Goal positions (will be set after scene setup)
-        self.goal_positions = None
-        self.goal_orientations = None
-        
+        self.goal_positions = None  # Goal positions for reward calculation
+        self.num_agents = 1
         super().__init__(cfg, render_mode, **kwargs)
 
     # ------------------------------------------------------------------
@@ -70,8 +63,8 @@ class TekoEnv(DirectRLEnv):
         # --- Setup cameras ---
         self._setup_cameras()
         
-        # --- Store goal positions for reward calculation ---
-        self._cache_goal_transforms(stage)
+        # --- Cache goal positions for reward calculation ---
+        self._cache_goal_transforms()
 
     def _setup_global_lighting(self, stage):
         """Setup global lighting (dome + sun) - shared across all envs."""
@@ -220,35 +213,20 @@ class TekoEnv(DirectRLEnv):
 
         print(f"[INFO] Initialized {len(self.cameras)} cameras.")
 
-    def _cache_goal_transforms(self, stage):
-        """Cache goal robot positions and orientations for reward calculation."""
+    def _cache_goal_transforms(self):
+        """Cache goal robot positions for reward calculation."""
         num_envs = self.scene.cfg.num_envs
         self.goal_positions = torch.zeros((num_envs, 3), device=self.device)
-        self.goal_orientations = torch.zeros((num_envs, 4), device=self.device)
         
+        # Goal robot is at fixed position (1.0, 0.0, 0.40) for all environments
+        # This is based on ground truth data from ArUco docking
         for env_idx in range(num_envs):
-            goal_path = f"/World/envs/env_{env_idx}/RobotGoal"
-            goal_prim = stage.GetPrimAtPath(goal_path)
-            
-            if goal_prim.IsValid():
-                xformable = UsdGeom.Xformable(goal_prim)
-                local_transform = xformable.GetLocalTransformation()
-                translation = local_transform.ExtractTranslation()
-                
-                # Store position (convert from USD Gf.Vec3d to torch)
-                self.goal_positions[env_idx] = torch.tensor(
-                    [translation[0], translation[1], translation[2]],
-                    device=self.device
-                )
-                
-                # For orientation, we'll use the default (180° rotation)
-                # Quaternion for 180° around Z: [0, 0, 1, 0] (x, y, z, w format)
-                self.goal_orientations[env_idx] = torch.tensor(
-                    [0.0, 0.0, 1.0, 0.0],
-                    device=self.device
-                )
+            self.goal_positions[env_idx] = torch.tensor(
+                [1.0, 0.0, 0.40],
+                device=self.device
+            )
         
-        print(f"[INFO] Cached {num_envs} goal transforms")
+        print(f"[INFO] Cached {num_envs} goal positions at (1.0, 0.0, 0.40)")
 
     # ------------------------------------------------------------------
     # Física / Observações / Ações
@@ -305,7 +283,7 @@ class TekoEnv(DirectRLEnv):
         num_envs = self.scene.cfg.num_envs
         h, w = self._cam_res[1], self._cam_res[0]
         
-        obs = {"rgb": torch.zeros((num_envs, 3, h, w), device=self.device)}
+        rgb_obs = torch.zeros((num_envs, 3, h, w), device=self.device)
 
         for env_idx, camera in enumerate(self.cameras):
             if env_idx >= num_envs:
@@ -318,71 +296,61 @@ class TekoEnv(DirectRLEnv):
                            .to(self.device)
                            .permute(2, 0, 1)
                            .float() / 255.0)
-                    obs["rgb"][env_idx] = rgb
+                    rgb_obs[env_idx] = rgb
             except Exception as e:
                 print(f"[WARN] Camera {env_idx} failed: {e}")
                 continue
 
-        return obs
+        # Return observations wrapped in "policy" key for SKRL
+        return {"policy": {"rgb": rgb_obs}}
 
     def _get_rewards(self):
-        """Compute docking rewards based on distance to goal."""
-        # Get robot positions and orientations
+        """Calculate distance-based docking rewards."""
+        # Get robot position
         robot_pos = self.robot.data.root_pos_w  # (num_envs, 3)
-        robot_quat = self.robot.data.root_quat_w  # (num_envs, 4) - [x, y, z, w]
-        
-        # Get joint velocities
-        joint_vel = self.robot.data.joint_vel  # (num_envs, num_joints)
         
         # Calculate distance to goal
-        distance = torch.norm(robot_pos - self.goal_positions, dim=-1)
+        distance = torch.norm(robot_pos - self.goal_positions, dim=-1)  # (num_envs,)
         
-        # Distance error from target
-        error = torch.abs(distance - self.target_distance)
+        # Target docking distance: 47.5cm = 0.475m
+        target_distance = 0.475
         
-        # Main reward: exponential decay with distance error
-        # Perfect alignment (0cm error) = 10.0
-        # 1cm error = ~5.0
-        # 5cm error = ~1.0
-        distance_reward = 10.0 * torch.exp(-error / 0.02)
+        # Calculate error from target
+        error = torch.abs(distance - target_distance)
         
-        # Success bonus when within tolerance
-        success_mask = error < self.tolerance
-        success_bonus = torch.where(success_mask, 
-                                    torch.ones_like(error) * 100.0,
-                                    torch.zeros_like(error))
+        # Reward: exponential decay with error
+        # Perfect docking (0cm error) = 10.0 reward
+        # 5cm error = ~6.0 reward
+        # 10cm error = ~3.7 reward
+        reward = 10.0 * torch.exp(-error / 0.05)
         
-        # Velocity penalty (encourage smooth, slow approach)
-        vel_magnitude = torch.norm(joint_vel, dim=-1)
-        velocity_penalty = -0.01 * (vel_magnitude / self._max_wheel_speed) ** 2
-        
-        # Total reward
-        total_reward = distance_reward + success_bonus + velocity_penalty
-        
-        return total_reward
+        return reward
 
     def _get_dones(self):
         """Determine episode termination conditions."""
-        num_envs = self.scene.cfg.num_envs
-        
-        # Get robot positions
+        # Get robot position
         robot_pos = self.robot.data.root_pos_w
         
         # Calculate distance to goal
         distance = torch.norm(robot_pos - self.goal_positions, dim=-1)
-        distance_error = torch.abs(distance - self.target_distance)
         
-        # Success: within tolerance
-        success = distance_error < self.tolerance
+        # Target docking distance and tolerance
+        target_distance = 0.475  # 47.5cm
+        tolerance = 0.01  # 1cm
+        
+        # Success: within target ± tolerance
+        error = torch.abs(distance - target_distance)
+        success = error < tolerance
         
         # Failure: too far from goal
-        too_far = distance > self.max_distance
+        max_distance = 2.0  # 2 meters
+        too_far = distance > max_distance
         
         # Terminate on success or failure
         terminated = success | too_far
         
-        # Time limit handled by DirectRLEnv
-        time_out = torch.zeros(num_envs, dtype=torch.bool, device=self.device)
+        # Time limit handled by DirectRLEnv (episode_length_s in config)
+        time_out = torch.zeros_like(terminated)
         
         return terminated, time_out
 
@@ -390,18 +358,3 @@ class TekoEnv(DirectRLEnv):
         """Reset specific environments."""
         super()._reset_idx(env_ids)
         self._lazy_init_articulation()
-        
-        # Optional: Randomize initial robot positions slightly
-        if len(env_ids) > 0:
-            # Small random perturbations to starting position
-            num_resets = len(env_ids)
-            pos_noise = torch.randn(num_resets, 3, device=self.device) * 0.05
-            pos_noise[:, 2] = 0  # Don't randomize Z (height)
-            
-            current_pos = self.robot.data.root_pos_w[env_ids]
-            new_pos = current_pos + pos_noise
-            
-            self.robot.write_root_pose_to_sim(
-                torch.cat([new_pos, self.robot.data.root_quat_w[env_ids]], dim=-1),
-                env_ids=env_ids
-            )

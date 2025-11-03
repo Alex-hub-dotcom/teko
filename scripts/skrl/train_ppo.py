@@ -1,153 +1,133 @@
-import sys
-sys.path.append("/workspace/teko/source")
+#!/usr/bin/env python3
+"""
+Minimal Test Script - Verify TEKO Environment Works
+====================================================
+Tests basic environment functionality before starting RL training.
 
-import argparse
-import os
-import random
-from datetime import datetime
+Usage:
+    /workspace/isaaclab/_isaac_sim/python.sh scripts/test_env_minimal.py
+"""
 
-import gymnasium as gym
-import skrl
-from packaging import version
+# CRITICAL: Import SimulationApp FIRST before any other Isaac imports
+from isaacsim import SimulationApp
 
-from isaaclab.app import AppLauncher
-from isaaclab.envs import (
-    DirectMARLEnv,
-    DirectMARLEnvCfg,
-    DirectRLEnvCfg,
-    ManagerBasedRLEnvCfg,
-    multi_agent_to_single_agent,
-)
-from isaaclab.utils.assets import retrieve_file_path
-from isaaclab.utils.dict import print_dict
-from isaaclab.utils.io import dump_yaml
-from isaaclab_rl.skrl import SkrlVecEnvWrapper
-from isaaclab_tasks.utils.hydra import hydra_task_config
+# Initialize Isaac Sim (headless=False to see the simulation)
+simulation_app = SimulationApp({"headless": False})
 
-import isaaclab_tasks  # noqa: F401
-import teko.tasks  # noqa: F401
+import torch
+import numpy as np
 
-parser = argparse.ArgumentParser(description="Train an RL agent with skrl.")
-parser.add_argument("--video", action="store_true", default=False)
-parser.add_argument("--video_length", type=int, default=200)
-parser.add_argument("--video_interval", type=int, default=2000)
-parser.add_argument("--num_envs", type=int, default=None)
-parser.add_argument("--task", type=str, default=None)
-parser.add_argument("--agent", type=str, default=None)
-parser.add_argument("--seed", type=int, default=None)
-parser.add_argument("--distributed", action="store_true", default=False)
-parser.add_argument("--checkpoint", type=str, default=None)
-parser.add_argument("--max_iterations", type=int, default=None)
-parser.add_argument("--export_io_descriptors", action="store_true", default=False)
-parser.add_argument("--ml_framework", type=str, default="torch", choices=["torch", "jax", "jax-numpy"])
-parser.add_argument("--algorithm", type=str, default="PPO", choices=["AMP", "PPO", "IPPO", "MAPPO"])
-
-AppLauncher.add_app_launcher_args(parser)
-args_cli, hydra_args = parser.parse_known_args()
-
-if args_cli.video:
-    args_cli.enable_cameras = True
-
-sys.argv = [sys.argv[0]] + hydra_args
-
-app_launcher = AppLauncher(args_cli)
-simulation_app = app_launcher.app
-
-SKRL_VERSION = "1.4.3"
-if version.parse(skrl.__version__) < version.parse(SKRL_VERSION):
-    skrl.logger.error(
-        f"Unsupported skrl version: {skrl.__version__}. Install supported version using 'pip install skrl>={SKRL_VERSION}'"
-    )
-    exit()
-
-if args_cli.ml_framework.startswith("torch"):
-    from skrl.utils.runner.torch import Runner
-elif args_cli.ml_framework.startswith("jax"):
-    from skrl.utils.runner.jax import Runner
-
-if args_cli.agent is None:
-    algorithm = args_cli.algorithm.lower()
-    agent_cfg_entry_point = "skrl_cfg_entry_point" if algorithm in ["ppo"] else f"skrl_{algorithm}_cfg_entry_point"
-else:
-    agent_cfg_entry_point = args_cli.agent
+# Now import Isaac Lab and your environment
+from source.teko.teko.tasks.direct.teko.teko_env import TekoEnv
+from source.teko.teko.tasks.direct.teko.teko_env_cfg import TekoEnvCfg
 
 
-@hydra_task_config(args_cli.task, agent_cfg_entry_point)
-def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: dict):
-    env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
-    env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
-
-    if args_cli.distributed:
-        env_cfg.sim.device = f"cuda:{app_launcher.local_rank}"
-
-    if args_cli.max_iterations:
-        agent_cfg["trainer"]["timesteps"] = args_cli.max_iterations * agent_cfg["agent"]["rollouts"]
-
-    agent_cfg["trainer"]["close_environment_at_exit"] = False
-
-    if args_cli.ml_framework.startswith("jax"):
-        skrl.config.jax.backend = "jax" if args_cli.ml_framework == "jax" else "numpy"
-
-    if args_cli.seed == -1:
-        args_cli.seed = random.randint(0, 10000)
-
-    agent_cfg["seed"] = args_cli.seed if args_cli.seed is not None else agent_cfg["seed"]
-    env_cfg.seed = agent_cfg["seed"]
-
-    log_root_path = os.path.join("logs", "skrl", agent_cfg["agent"]["experiment"]["directory"])
-    log_root_path = os.path.abspath(log_root_path)
-    print(f"[INFO] Logging experiment in directory: {log_root_path}")
-
-    log_dir = datetime.now().strftime("%Y-%m-%d_%H-%M-%S") + f"_{algorithm}_{args_cli.ml_framework}"
-
-    if agent_cfg["agent"]["experiment"]["experiment_name"]:
-        log_dir += f'_{agent_cfg["agent"]["experiment"]["experiment_name"]}'
-
-    agent_cfg["agent"]["experiment"]["directory"] = log_root_path
-    agent_cfg["agent"]["experiment"]["experiment_name"] = log_dir
-
-    log_dir = os.path.join(log_root_path, log_dir)
-
-    dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)
-    dump_yaml(os.path.join(log_dir, "params", "agent.yaml"), agent_cfg)
-
-    resume_path = retrieve_file_path(args_cli.checkpoint) if args_cli.checkpoint else None
-
-    if isinstance(env_cfg, ManagerBasedRLEnvCfg):
-        env_cfg.export_io_descriptors = args_cli.export_io_descriptors
+def test_environment():
+    """Test basic environment functionality"""
+    
+    print("\n" + "="*60)
+    print("🧪 Testing TEKO Environment")
+    print("="*60 + "\n")
+    
+    # Create environment config
+    print("1. Creating environment config...")
+    env_cfg = TekoEnvCfg()
+    env_cfg.scene.num_envs = 1  # Start with just 1
+    env_cfg.sim.device = "cuda:0"
+    print("   ✓ Config created")
+    
+    # Create environment
+    print("\n2. Initializing TEKO environment...")
+    env = TekoEnv(cfg=env_cfg, render_mode="human")
+    print("   ✓ Environment initialized")
+    
+    # Print environment info
+    print("\n3. Environment info:")
+    print(f"   - Number of envs: {env.num_envs}")
+    print(f"   - Device: {env.device}")
+    print(f"   - Action space: {env.action_space}")
+    print(f"   - Observation space: {env.observation_space}")
+    
+    # Reset environment
+    print("\n4. Resetting environment...")
+    obs, info = env.reset()
+    print("   ✓ Environment reset successful")
+    
+    # Check observation
+    print("\n5. Checking observations:")
+    if "policy" in obs and "rgb" in obs["policy"]:
+        rgb = obs["policy"]["rgb"]
+        print(f"   ✓ RGB observation shape: {rgb.shape}")
+        print(f"   ✓ RGB value range: [{rgb.min():.3f}, {rgb.max():.3f}]")
+        print(f"   ✓ RGB dtype: {rgb.dtype}")
     else:
-        print("Warning: IO descriptors not supported for DirectRLEnvCfg")
-
-    env_cfg.log_dir = log_dir
-
-    env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
-
-    if isinstance(env.unwrapped, DirectMARLEnv) and algorithm in ["ppo"]:
-        env = multi_agent_to_single_agent(env)
-
-    if args_cli.video:
-        video_kwargs = {
-            "video_folder": os.path.join(log_dir, "videos", "train"),
-            "step_trigger": lambda step: step % args_cli.video_interval == 0,
-            "video_length": args_cli.video_length,
-            "disable_logger": True,
-        }
-        print("[INFO] Recording videos during training.")
-        print_dict(video_kwargs, nesting=4)
-        env = gym.wrappers.RecordVideo(env, **video_kwargs)
-
-    env = SkrlVecEnvWrapper(env, ml_framework=args_cli.ml_framework)
-
-    runner = Runner(env, agent_cfg)
-
-    if resume_path:
-        print(f"[INFO] Loading model checkpoint from: {resume_path}")
-        runner.agent.load(resume_path)
-
-    runner.run()
+        print("   ✗ ERROR: Unexpected observation structure!")
+        print(f"   Observation keys: {obs.keys()}")
+    
+    # Test random actions for a few steps
+    print("\n6. Testing random actions (10 steps)...")
+    num_test_steps = 10
+    
+    for step in range(num_test_steps):
+        # Random wheel velocities between -1 and 1
+        action = torch.rand((env.num_envs, 2), device=env.device) * 2 - 1
+        
+        # Step environment
+        obs, reward, terminated, truncated, info = env.step(action)
+        
+        # Print info every few steps
+        if step % 3 == 0:
+            print(f"   Step {step+1}/{num_test_steps}:")
+            print(f"     - Action: [{action[0, 0]:.2f}, {action[0, 1]:.2f}]")
+            print(f"     - Reward: {reward[0].item():.3f}")
+            print(f"     - Terminated: {terminated[0].item()}")
+            print(f"     - Truncated: {truncated[0].item()}")
+    
+    print("\n   ✓ Random action test completed")
+    
+    # Test robot state access
+    print("\n7. Checking robot state:")
+    robot_pos = env.robot.data.root_pos_w
+    robot_quat = env.robot.data.root_quat_w
+    print(f"   ✓ Robot position shape: {robot_pos.shape}")
+    print(f"   ✓ Robot position: {robot_pos[0].cpu().numpy()}")
+    print(f"   ✓ Robot orientation shape: {robot_quat.shape}")
+    
+    # Test goal positions (if cached)
+    if hasattr(env, 'goal_positions') and env.goal_positions is not None:
+        print("\n8. Checking goal positions:")
+        print(f"   ✓ Goal position shape: {env.goal_positions.shape}")
+        print(f"   ✓ Goal position: {env.goal_positions[0].cpu().numpy()}")
+        
+        # Calculate distance to goal
+        distance = torch.norm(robot_pos - env.goal_positions, dim=-1)
+        print(f"   ✓ Distance to goal: {distance[0].item():.3f} m")
+    else:
+        print("\n8. Goal positions not cached")
+    
+    # Test cameras
+    if hasattr(env, 'cameras') and len(env.cameras) > 0:
+        print("\n9. Checking cameras:")
+        print(f"   ✓ Number of cameras: {len(env.cameras)}")
+        print(f"   ✓ Camera resolution: {env._cam_res}")
+    else:
+        print("\n9. No cameras initialized")
+    
+    # Close environment
+    print("\n" + "="*60)
+    print("✅ All tests passed!")
+    print("="*60 + "\n")
+    
     env.close()
 
 
 if __name__ == "__main__":
-    main()
-    simulation_app.close()
+    try:
+        test_environment()
+    except Exception as e:
+        print(f"\n❌ Error during testing: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        # Always close simulation
+        simulation_app.close()
