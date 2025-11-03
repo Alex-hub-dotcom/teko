@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """
-Minimal PPO Training Script for TEKO Docking - FINAL VERSION (with camera shape + flatten/reshape fixes)
-=======================================================================================================
-Usage:
-    /workspace/isaaclab/_isaac_sim/python.sh scripts/skrl/train_ppo_minimal.py --num_envs 1
+Minimal PPO Training Script for TEKO Docking – FULL FIXED VERSION
+=================================================================
+Handles multi-environment setup (num_envs > 1), flattens camera
+observations, and ensures reward/done tensors have shape [num_envs].
 """
 
 from isaacsim import SimulationApp
 import argparse
 
 # ------------------------------------------------------------
-# Simulation arguments
+# CLI arguments
 # ------------------------------------------------------------
 parser = argparse.ArgumentParser()
 parser.add_argument("--num_envs", type=int, default=1)
@@ -22,6 +22,8 @@ simulation_app = SimulationApp({"headless": args.headless})
 # ------------------------------------------------------------
 # Imports
 # ------------------------------------------------------------
+import numpy as np
+import gymnasium as gym
 import torch
 import torch.nn as nn
 from datetime import datetime
@@ -38,56 +40,59 @@ from source.teko.teko.tasks.direct.teko.agents.cnn_model import create_visual_en
 
 
 # ------------------------------------------------------------
-# Simple wrapper for SKRL compatibility
+# Wrapper for SKRL
 # ------------------------------------------------------------
 class SimpleEnvWrapper:
-    """Minimal wrapper for SKRL compatibility"""
+    """Expose a single-agent SKRL-compatible API for multi-env TEKO."""
     def __init__(self, env):
         self.env = env
-        self.observation_space = env.observation_space
-        self.action_space = env.action_space
-        self.num_envs = getattr(env, "num_envs", 1)
+        self.num_envs = getattr(env.scene.cfg, "num_envs", 1)
         self.num_agents = 1
         self.device = getattr(env, "device", "cuda:0")
-    
+
+        H, W = env.cfg.camera.height, env.cfg.camera.width
+        self.observation_space = gym.spaces.Box(low=0, high=255, shape=(3, H, W), dtype=np.uint8)
+        self.action_space = gym.spaces.Box(low=-1.0, high=1.0, shape=(2,), dtype=np.float32)
+
     def reset(self):
         obs, info = self.env.reset()
-        return self._extract_rgb(obs), info
-    
+        rgb = self._extract_rgb(obs).to(self.device).float()
+        rgb = rgb.view(rgb.shape[0], -1)
+        return rgb, info
+
     def step(self, action):
-        if isinstance(action, (list, tuple)):
-            action = action[0] if len(action) == 1 else torch.stack(action)
         if not isinstance(action, torch.Tensor):
             action = torch.as_tensor(action, dtype=torch.float32)
         if action.ndim == 1:
             action = action.unsqueeze(0)
-        
-        obs, reward, terminated, truncated, info = self.env.step(action.to(self.device))
-        return self._extract_rgb(obs), reward, terminated, truncated, info
-    
+        action = action.to(self.device)
+
+        obs, reward, terminated, truncated, info = self.env.step(action)
+
+        rgb = self._extract_rgb(obs).to(self.device).float()
+        rgb = rgb.view(rgb.shape[0], -1)  # flatten camera frames
+
+         # ✅ force everything to [num_envs, 1] (what SKRL memory expects)
+        reward = reward.reshape(-1, 1).contiguous()
+        terminated = terminated.reshape(-1, 1).contiguous()
+        truncated = truncated.reshape(-1, 1).contiguous()
+
+        # Debug
+        # print(f"[DEBUG shapes after fix] obs:{rgb.shape}, reward:{reward.shape}, term:{terminated.shape}")
+
+        return rgb, reward, terminated, truncated, info
+
     def _extract_rgb(self, obs):
-        """Extract and FLATTEN RGB tensor so SKRL memory sees a 1D vector per env"""
         if isinstance(obs, dict):
             if "policy" in obs and isinstance(obs["policy"], dict):
-                rgb = obs["policy"]["rgb"]
+                return obs["policy"]["rgb"]
             elif "rgb" in obs:
-                rgb = obs["rgb"]
-            else:
-                rgb = obs
-        else:
-            rgb = obs
+                return obs["rgb"]
+        return obs
 
-        if isinstance(rgb, torch.Tensor):
-            rgb = rgb.to(self.device)
-            # Expect [B, 3, 480, 640] -> flatten to [B, 921600]
-            if rgb.ndim == 3:
-                rgb = rgb.unsqueeze(0)
-            rgb = rgb.view(rgb.size(0), -1)
-        return rgb
-    
     def render(self):
         pass
-    
+
     def close(self):
         self.env.close()
 
@@ -108,12 +113,9 @@ class PolicyNetwork(GaussianMixin, Model):
         self.log_std = nn.Parameter(torch.zeros(self.num_actions))
 
     def compute(self, inputs, role):
-        rgb = inputs["states"]  # flattened by wrapper: [B, 921600]
-
-        # If flattened, reshape back to [B, 3, 480, 640]
-        if isinstance(rgb, torch.Tensor) and rgb.ndim == 2 and rgb.shape[1] == 3 * 480 * 640:
+        rgb = inputs["states"]
+        if rgb.ndim == 2 and rgb.shape[1] == 3 * 480 * 640:
             rgb = rgb.view(rgb.shape[0], 3, 480, 640)
-
         features = self.encoder(rgb)
         actions = self.policy(features)
         return actions, self.log_std, {}
@@ -131,65 +133,51 @@ class ValueNetwork(DeterministicMixin, Model):
         )
 
     def compute(self, inputs, role):
-        rgb = inputs["states"]  # flattened by wrapper
-
-        # If flattened, reshape back to [B, 3, 480, 640]
-        if isinstance(rgb, torch.Tensor) and rgb.ndim == 2 and rgb.shape[1] == 3 * 480 * 640:
+        rgb = inputs["states"]
+        if rgb.ndim == 2 and rgb.shape[1] == 3 * 480 * 640:
             rgb = rgb.view(rgb.shape[0], 3, 480, 640)
-
         features = self.encoder(rgb)
         return self.value(features), {}
 
 
 # ------------------------------------------------------------
-# Training routine
+# Training loop
 # ------------------------------------------------------------
 def train():
     print("\n" + "=" * 70)
-    print("🚀 TEKO Vision-Based Docking – PPO Training (FINAL)")
+    print("🚀 TEKO Vision-Based Docking – PPO Training (FINAL-FIXED)")
     print("=" * 70 + "\n")
 
     set_seed(42)
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
-    # ---------------------------
-    # Environment setup
-    # ---------------------------
+    # --- Environment setup ---
     env_cfg = TekoEnvCfg()
     env_cfg.scene.num_envs = args.num_envs
     env_cfg.sim.device = str(device)
-
     env = TekoEnv(cfg=env_cfg, render_mode=None if args.headless else "human")
 
-    # Step the simulation a few times to let the camera produce frames
+    # Warm-up to make sure cameras deliver frames
     print("[INFO] Warming up simulation for camera readiness...")
-    for _ in range(10):  # ~10 render frames
+    for _ in range(10):
         env.sim.step()
-
-    # Now safely initialize observation space (uses a real camera frame)
     env._init_observation_space()
-
-    # Optional: run one reset after initializing obs space
     _ = env.reset()
 
     env = SimpleEnvWrapper(env)
-
-    print("✓ Environment created")
+    print(f"✓ Environment created with {env.num_envs} envs")
     print(f"  Observation space: {env.observation_space}")
     print(f"  Action space: {env.action_space}")
 
-    # Quick sanity check (now flattened)
     obs, _ = env.reset()
-    print(f"[DEBUG] First obs shape seen by policy: {tuple(obs.shape)}")  # expect (num_envs, 921600)
+    print(f"[DEBUG] First obs shape seen by policy: {tuple(obs.shape)}")
 
-    # ---------------------------
-    # PPO setup
-    # ---------------------------
+    # --- PPO setup ---
     policy = PolicyNetwork(env.observation_space, env.action_space, device)
     value = ValueNetwork(env.observation_space, env.action_space, device)
-    print(f"✓ Policy: {sum(p.numel() for p in policy.parameters()):,} params")
-    print(f"✓ Value:  {sum(p.numel() for p in value.parameters()):,} params")
+    print(f"✓ Policy params: {sum(p.numel() for p in policy.parameters()):,}")
+    print(f"✓ Value  params: {sum(p.numel() for p in value.parameters()):,}")
 
     ppo_cfg = PPO_DEFAULT_CONFIG.copy()
     ppo_cfg.update({
@@ -215,7 +203,7 @@ def train():
         models={"policy": policy, "value": value},
         memory=memory,
         cfg=ppo_cfg,
-        observation_space=env.observation_space,  # SKRL will flatten Dict space internally
+        observation_space=env.observation_space,
         action_space=env.action_space,
         device=device,
     )
@@ -233,12 +221,12 @@ def train():
 
     print("\n✅ Training complete!")
     agent.save(f"{exp_dir}/final_model.pt")
-    print(f"💾 Model saved: {exp_dir}/final_model.pt\n")
+    print(f"💾 Model saved to {exp_dir}/final_model.pt\n")
     env.close()
 
 
 # ------------------------------------------------------------
-# Entry point
+# Entry
 # ------------------------------------------------------------
 if __name__ == "__main__":
     try:
