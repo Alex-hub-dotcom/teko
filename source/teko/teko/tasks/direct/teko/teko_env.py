@@ -1,4 +1,4 @@
-############ ENV - Multi-Environment Compatible (FINAL)
+############ ENV - Multi-Environment Compatible (FINAL + Observation Space)
 # SPDX-License-Identifier: BSD-3-Clause
 """
 TEKO Environment — Isaac Lab 0.47.1 (Multi-Environment Support)
@@ -38,6 +38,40 @@ class TekoEnv(DirectRLEnv):
         self.goal_positions = None  # Goal positions for reward calculation
         self.num_agents = 1
         super().__init__(cfg, render_mode, **kwargs)
+
+    # ------------------------------------------------------------------
+    # Observation space initialization (NEW)
+    # ------------------------------------------------------------------
+    def _init_observation_space(self):
+        """Initialize observation space using actual camera output."""
+        import gymnasium as gym
+        import numpy as np
+        import cv2
+        import torch
+
+        if not self.cameras:
+            print("[WARN] _init_observation_space called before cameras exist")
+            return
+
+        # Take one frame from first camera
+        frame = self.cameras[0].get_rgba()  # or get_rgb()
+        if isinstance(frame, torch.Tensor):
+            frame = frame.detach().cpu().numpy()
+        if frame.shape[-1] == 4:
+            frame = frame[..., :3]
+
+        target_w = self.cfg.camera.width
+        target_h = self.cfg.camera.height
+        frame = cv2.resize(frame, (target_w, target_h))
+
+        frame = np.transpose(frame, (2, 0, 1))  # (3, H, W)
+
+        # Define Gymnasium observation space
+        self.observation_space = gym.spaces.Dict({
+            "rgb": gym.spaces.Box(low=0, high=255, shape=frame.shape, dtype=np.uint8)
+        })
+
+        print(f"[INFO] Observation space set to {frame.shape}")
 
     # ------------------------------------------------------------------
     # Setup da cena
@@ -190,6 +224,7 @@ class TekoEnv(DirectRLEnv):
         material.CreateSurfaceOutput().ConnectToSource(shader_output)
         UsdShade.MaterialBindingAPI(mesh).Bind(material)
 
+
     def _setup_cameras(self):
         """Initialize one camera per environment."""
         sim = SimulationContext.instance()
@@ -211,7 +246,7 @@ class TekoEnv(DirectRLEnv):
             camera.initialize()
             
             # Debug: Check actual camera resolution
-            print(f"[DEBUG] Camera {env_idx} requested: {self._cam_res}, actual: {camera.get_rgba().shape if camera.get_rgba() is not None else 'None'}")
+            #print(f"[DEBUG] Camera {env_idx} requested: {self._cam_res}, actual: {camera.get_rgba().shape if camera.get_rgba() is not None else 'None'}")
             
             self.cameras.append(camera)
 
@@ -303,8 +338,12 @@ class TekoEnv(DirectRLEnv):
                            .permute(2, 0, 1)
                            .float() / 255.0)
                     
+                    # Debug: Check actual camera output
+                    print(f"[DEBUG] Camera {env_idx} raw shape: {rgb.shape}, target: ({h}, {w})")
+                    
                     # Force resize if camera returns wrong resolution
                     if rgb.shape[-2:] != (h, w):
+                        print(f"[DEBUG] Resizing from {rgb.shape[-2:]} to ({h}, {w})")
                         rgb = F.interpolate(rgb.unsqueeze(0), size=(h, w), mode='bilinear', align_corners=False).squeeze(0)
                     
                     rgb_obs[env_idx] = rgb
