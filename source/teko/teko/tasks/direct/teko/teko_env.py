@@ -1,4 +1,4 @@
-############ ENV - Multi-Environment Compatible (FIXED v3 - with Goal Caching)
+############ ENV - Multi-Environment Compatible (FINAL)
 # SPDX-License-Identifier: BSD-3-Clause
 """
 TEKO Environment — Isaac Lab 0.47.1 (Multi-Environment Support)
@@ -209,6 +209,10 @@ class TekoEnv(DirectRLEnv):
                 frequency=self.cfg.camera.frequency_hz,
             )
             camera.initialize()
+            
+            # Debug: Check actual camera resolution
+            print(f"[DEBUG] Camera {env_idx} requested: {self._cam_res}, actual: {camera.get_rgba().shape if camera.get_rgba() is not None else 'None'}")
+            
             self.cameras.append(camera)
 
         print(f"[INFO] Initialized {len(self.cameras)} cameras.")
@@ -280,6 +284,8 @@ class TekoEnv(DirectRLEnv):
 
     def _get_observations(self):
         """Get RGB observations from all cameras."""
+        import torch.nn.functional as F
+        
         num_envs = self.scene.cfg.num_envs
         h, w = self._cam_res[1], self._cam_res[0]
         
@@ -296,6 +302,11 @@ class TekoEnv(DirectRLEnv):
                            .to(self.device)
                            .permute(2, 0, 1)
                            .float() / 255.0)
+                    
+                    # Force resize if camera returns wrong resolution
+                    if rgb.shape[-2:] != (h, w):
+                        rgb = F.interpolate(rgb.unsqueeze(0), size=(h, w), mode='bilinear', align_corners=False).squeeze(0)
+                    
                     rgb_obs[env_idx] = rgb
             except Exception as e:
                 print(f"[WARN] Camera {env_idx} failed: {e}")
