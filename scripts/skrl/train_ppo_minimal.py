@@ -1,64 +1,71 @@
 #!/usr/bin/env python3
 """
-Minimal PPO Training Script for TEKO Docking – FULL FIXED VERSION
-=================================================================
-Handles multi-environment setup (num_envs > 1), flattens camera
-observations, and ensures reward/done tensors have shape [num_envs].
+Improved PPO Training for Vision-Based Docking
+===============================================
+Fixed version (2025-11-04)
+- Handles flattened RGB observations to avoid shape mismatch
+- Keeps CNN encoder intact
+- Compatible with SKRL memory allocation
 """
 
 from isaacsim import SimulationApp
 import argparse
 
-# ------------------------------------------------------------
-# CLI arguments
-# ------------------------------------------------------------
 parser = argparse.ArgumentParser()
-parser.add_argument("--num_envs", type=int, default=1)
+parser.add_argument("--num_envs", type=int, default=16)
 parser.add_argument("--headless", action="store_true")
+parser.add_argument("--curriculum", action="store_true", help="Enable curriculum learning")
+parser.add_argument("--debug_camera", action="store_true", help="Save camera frames for debugging")
 args = parser.parse_args()
 
 simulation_app = SimulationApp({"headless": args.headless})
 
-# ------------------------------------------------------------
-# Imports
-# ------------------------------------------------------------
 import numpy as np
 import gymnasium as gym
 import torch
 import torch.nn as nn
 from datetime import datetime
+import os
+from pathlib import Path
 
 from skrl.agents.torch.ppo import PPO, PPO_DEFAULT_CONFIG
 from skrl.memories.torch import RandomMemory
 from skrl.models.torch import DeterministicMixin, GaussianMixin, Model
 from skrl.trainers.torch import SequentialTrainer
 from skrl.utils import set_seed
+from skrl.resources.schedulers.torch import KLAdaptiveRL
 
 from source.teko.teko.tasks.direct.teko.teko_env import TekoEnv
 from source.teko.teko.tasks.direct.teko.teko_env_cfg import TekoEnvCfg
 from source.teko.teko.tasks.direct.teko.agents.cnn_model import create_visual_encoder
 
 
-# ------------------------------------------------------------
-# Wrapper for SKRL
-# ------------------------------------------------------------
+# =====================================================================
+# ENV WRAPPER (Flattened observations for SKRL compatibility)
+# =====================================================================
 class SimpleEnvWrapper:
-    """Expose a single-agent SKRL-compatible API for multi-env TEKO."""
-    def __init__(self, env):
+    def __init__(self, env, debug_camera=False):
         self.env = env
         self.num_envs = getattr(env.scene.cfg, "num_envs", 1)
         self.num_agents = 1
         self.device = getattr(env, "device", "cuda:0")
+        self.debug_camera = debug_camera
+        self.frame_count = 0
 
         H, W = env.cfg.camera.height, env.cfg.camera.width
-        self.observation_space = gym.spaces.Box(low=0, high=255, shape=(3, H, W), dtype=np.uint8)
+        self.H, self.W, self.C = H, W, 3
+        self.flat_dim = self.C * H * W
+
+        # flatten the RGB image (3*H*W)
+        self.observation_space = gym.spaces.Box(low=0, high=1, shape=(self.flat_dim,), dtype=np.float32)
         self.action_space = gym.spaces.Box(low=-1.0, high=1.0, shape=(2,), dtype=np.float32)
 
     def reset(self):
         obs, info = self.env.reset()
-        rgb = self._extract_rgb(obs).to(self.device).float()
-        rgb = rgb.view(rgb.shape[0], -1)
-        return rgb, info
+        rgb = self._extract_rgb(obs).to(self.device).float()  # (B,3,H,W)
+        if self.debug_camera and self.frame_count == 0:
+            self._save_debug_frame(rgb[0], "reset")
+        return rgb.view(self.num_envs, -1).contiguous(), info  # flatten
 
     def step(self, action):
         if not isinstance(action, torch.Tensor):
@@ -68,19 +75,17 @@ class SimpleEnvWrapper:
         action = action.to(self.device)
 
         obs, reward, terminated, truncated, info = self.env.step(action)
+        rgb = self._extract_rgb(obs).to(self.device).float()  # (B,3,H,W)
 
-        rgb = self._extract_rgb(obs).to(self.device).float()
-        rgb = rgb.view(rgb.shape[0], -1)  # flatten camera frames
+        if self.debug_camera and self.frame_count % 100 == 0:
+            self._save_debug_frame(rgb[0], f"step_{self.frame_count}")
+        self.frame_count += 1
 
-         # ✅ force everything to [num_envs, 1] (what SKRL memory expects)
         reward = reward.reshape(-1, 1).contiguous()
         terminated = terminated.reshape(-1, 1).contiguous()
         truncated = truncated.reshape(-1, 1).contiguous()
 
-        # Debug
-        # print(f"[DEBUG shapes after fix] obs:{rgb.shape}, reward:{reward.shape}, term:{terminated.shape}")
-
-        return rgb, reward, terminated, truncated, info
+        return rgb.view(self.num_envs, -1).contiguous(), reward, terminated, truncated, info
 
     def _extract_rgb(self, obs):
         if isinstance(obs, dict):
@@ -90,6 +95,16 @@ class SimpleEnvWrapper:
                 return obs["rgb"]
         return obs
 
+    def _save_debug_frame(self, rgb_tensor, name):
+        import cv2
+        os.makedirs("/workspace/teko/debug_frames", exist_ok=True)
+        frame = rgb_tensor.cpu().permute(1, 2, 0).numpy() * 255
+        frame = frame.astype(np.uint8)
+        frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        save_path = f"/workspace/teko/debug_frames/{name}.png"
+        cv2.imwrite(save_path, frame_bgr)
+        print(f"[DEBUG] Saved camera frame: {save_path}")
+
     def render(self):
         pass
 
@@ -97,13 +112,14 @@ class SimpleEnvWrapper:
         self.env.close()
 
 
-# ------------------------------------------------------------
-# PPO Networks
-# ------------------------------------------------------------
+# =====================================================================
+# MODELS (reshape flat → image before CNN)
+# =====================================================================
 class PolicyNetwork(GaussianMixin, Model):
     def __init__(self, observation_space, action_space, device, **kwargs):
         Model.__init__(self, observation_space, action_space, device)
         GaussianMixin.__init__(self, **kwargs)
+        self.C, self.H, self.W = 3, 480, 640
         self.encoder = create_visual_encoder("simple", feature_dim=256, pretrained=False)
         self.policy = nn.Sequential(
             nn.Linear(256, 128), nn.ReLU(),
@@ -113,18 +129,18 @@ class PolicyNetwork(GaussianMixin, Model):
         self.log_std = nn.Parameter(torch.zeros(self.num_actions))
 
     def compute(self, inputs, role):
-        rgb = inputs["states"]
-        if rgb.ndim == 2 and rgb.shape[1] == 3 * 480 * 640:
-            rgb = rgb.view(rgb.shape[0], 3, 480, 640)
-        features = self.encoder(rgb)
-        actions = self.policy(features)
-        return actions, self.log_std, {}
+        x = inputs["states"]  # (B, flat)
+        x = x.view(x.shape[0], self.C, self.H, self.W)
+        feat = self.encoder(x)
+        act = self.policy(feat)
+        return act, self.log_std, {}
 
 
 class ValueNetwork(DeterministicMixin, Model):
     def __init__(self, observation_space, action_space, device, **kwargs):
         Model.__init__(self, observation_space, action_space, device)
         DeterministicMixin.__init__(self, **kwargs)
+        self.C, self.H, self.W = 3, 480, 640
         self.encoder = create_visual_encoder("simple", feature_dim=256, pretrained=False)
         self.value = nn.Sequential(
             nn.Linear(256, 128), nn.ReLU(),
@@ -133,47 +149,75 @@ class ValueNetwork(DeterministicMixin, Model):
         )
 
     def compute(self, inputs, role):
-        rgb = inputs["states"]
-        if rgb.ndim == 2 and rgb.shape[1] == 3 * 480 * 640:
-            rgb = rgb.view(rgb.shape[0], 3, 480, 640)
-        features = self.encoder(rgb)
-        return self.value(features), {}
+        x = inputs["states"]
+        x = x.view(x.shape[0], self.C, self.H, self.W)
+        feat = self.encoder(x)
+        return self.value(feat), {}
 
 
-# ------------------------------------------------------------
-# Training loop
-# ------------------------------------------------------------
+# =====================================================================
+# CURRICULUM (unchanged)
+# =====================================================================
+class CurriculumScheduler:
+    def __init__(self, env, enabled=True):
+        self.env = env
+        self.enabled = enabled
+        self.current_level = 0
+        self.success_threshold = 0.7
+        self.window_size = 1000
+        self.episode_outcomes = []
+
+    def update(self, success):
+        if not self.enabled:
+            return
+        self.episode_outcomes.append(success)
+        if len(self.episode_outcomes) > self.window_size:
+            self.episode_outcomes.pop(0)
+        if len(self.episode_outcomes) >= self.window_size:
+            success_rate = sum(self.episode_outcomes) / len(self.episode_outcomes)
+            if success_rate >= self.success_threshold and self.current_level < 2:
+                self.current_level += 1
+                self.env.env.set_curriculum_level(self.current_level)
+                self.episode_outcomes = []
+                print(f"\n{'='*70}")
+                print(f"🎓 CURRICULUM ADVANCED TO LEVEL {self.current_level}")
+                print(f"   Success rate: {success_rate:.1%}")
+                print(f"{'='*70}\n")
+
+
+# =====================================================================
+# TRAIN FUNCTION
+# =====================================================================
 def train():
     print("\n" + "=" * 70)
-    print("🚀 TEKO Vision-Based Docking – PPO Training (FINAL-FIXED)")
+    print("🚀 TEKO Vision-Based Docking – Improved PPO Training (Fixed)")
     print("=" * 70 + "\n")
 
     set_seed(42)
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
-    # --- Environment setup ---
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    exp_dir = f"/workspace/teko/runs/teko_ppo_{timestamp}"
+    os.makedirs(exp_dir, exist_ok=True)
+    print(f"Experiment directory: {exp_dir}")
+
     env_cfg = TekoEnvCfg()
     env_cfg.scene.num_envs = args.num_envs
     env_cfg.sim.device = str(device)
     env = TekoEnv(cfg=env_cfg, render_mode=None if args.headless else "human")
 
-    # Warm-up to make sure cameras deliver frames
-    print("[INFO] Warming up simulation for camera readiness...")
+    print("[INFO] Warming up simulation...")
     for _ in range(10):
         env.sim.step()
     env._init_observation_space()
     _ = env.reset()
 
-    env = SimpleEnvWrapper(env)
+    env = SimpleEnvWrapper(env, debug_camera=args.debug_camera)
     print(f"✓ Environment created with {env.num_envs} envs")
     print(f"  Observation space: {env.observation_space}")
     print(f"  Action space: {env.action_space}")
 
-    obs, _ = env.reset()
-    print(f"[DEBUG] First obs shape seen by policy: {tuple(obs.shape)}")
-
-    # --- PPO setup ---
     policy = PolicyNetwork(env.observation_space, env.action_space, device)
     value = ValueNetwork(env.observation_space, env.action_space, device)
     print(f"✓ Policy params: {sum(p.numel() for p in policy.parameters()):,}")
@@ -181,21 +225,27 @@ def train():
 
     ppo_cfg = PPO_DEFAULT_CONFIG.copy()
     ppo_cfg.update({
-        "rollouts": 16,
-        "learning_epochs": 8,
-        "mini_batches": 2,
+        "rollouts": 32,
+        "learning_epochs": 10,
+        "mini_batches": 4,
         "discount_factor": 0.99,
         "lambda": 0.95,
         "learning_rate": 3e-4,
         "random_timesteps": 0,
         "learning_starts": 0,
-        "grad_norm_clip": 1.0,
+        "grad_norm_clip": 0.5,
         "ratio_clip": 0.2,
         "value_clip": 0.2,
         "clip_predicted_values": True,
         "entropy_loss_scale": 0.01,
         "value_loss_scale": 0.5,
         "kl_threshold": 0,
+        "learning_rate_scheduler": KLAdaptiveRL,
+        "learning_rate_scheduler_kwargs": {
+            "kl_threshold": 0.008,
+            "min_lr": 1e-5,
+            "max_lr": 1e-3,
+        }
     })
 
     memory = RandomMemory(memory_size=ppo_cfg["rollouts"], num_envs=args.num_envs, device=device)
@@ -208,26 +258,50 @@ def train():
         device=device,
     )
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    exp_dir = f"runs/teko_ppo_{timestamp}"
-    trainer_cfg = {"timesteps": 50000, "headless": args.headless}
+    curriculum = CurriculumScheduler(env, enabled=args.curriculum)
+    if args.curriculum:
+        print("✓ Curriculum learning enabled")
+
+    trainer_cfg = {
+        "timesteps": 200000,
+        "headless": args.headless,
+        "disable_progressbar": False,
+        "close_environment_at_exit": True,
+    }
+
     trainer = SequentialTrainer(cfg=trainer_cfg, env=env, agents=agent)
 
     print("\n" + "=" * 70)
     print("🎓 Starting training...")
+    if args.curriculum:
+        print("   Curriculum: Level 0 (close spawn)")
     print("=" * 70 + "\n")
 
-    trainer.train()
+    try:
+        trainer.train()
+    except KeyboardInterrupt:
+        print("\n⚠️ Training interrupted by user")
 
     print("\n✅ Training complete!")
     agent.save(f"{exp_dir}/final_model.pt")
-    print(f"💾 Model saved to {exp_dir}/final_model.pt\n")
+    print(f"💾 Model saved to {exp_dir}/final_model.pt")
+
+    with open(f"{exp_dir}/training_summary.txt", "w") as f:
+        f.write(f"Training Summary\n")
+        f.write(f"================\n")
+        f.write(f"Timestamp: {timestamp}\n")
+        f.write(f"Num Envs: {args.num_envs}\n")
+        f.write(f"Total Timesteps: {trainer_cfg['timesteps']}\n")
+        f.write(f"Curriculum: {args.curriculum}\n")
+        f.write(f"Final Level: {curriculum.current_level if args.curriculum else 'N/A'}\n")
+
     env.close()
+    print(f"\n📊 Training logs saved to: {exp_dir}\n")
 
 
-# ------------------------------------------------------------
-# Entry
-# ------------------------------------------------------------
+# =====================================================================
+# MAIN
+# =====================================================================
 if __name__ == "__main__":
     try:
         train()
