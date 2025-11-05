@@ -2,10 +2,11 @@
 """
 Improved PPO Training for Vision-Based Docking
 ===============================================
-Fixed version (2025-11-04)
+Fixed version (2025-11-05)
 - Handles flattened RGB observations to avoid shape mismatch
 - Keeps CNN encoder intact
 - Compatible with SKRL memory allocation
+- Simple console reward logger every 500 env steps (inside the env wrapper)
 """
 
 from isaacsim import SimulationApp
@@ -60,6 +61,15 @@ class SimpleEnvWrapper:
         self.observation_space = gym.spaces.Box(low=0, high=1, shape=(self.flat_dim,), dtype=np.float32)
         self.action_space = gym.spaces.Box(low=-1.0, high=1.0, shape=(2,), dtype=np.float32)
 
+        # ---------------- REWARD CONSOLE LOGGER ----------------
+        self._log_interval = 500               # print every 500 env steps
+        self._global_step = 0
+        # keep running sums on device to avoid host sync
+        self._acc_sum = torch.zeros(1, device=self.device)
+        self._acc_sq_sum = torch.zeros(1, device=self.device)
+        self._acc_count = 0
+        # -------------------------------------------------------
+
     def reset(self):
         obs, info = self.env.reset()
         rgb = self._extract_rgb(obs).to(self.device).float()  # (B,3,H,W)
@@ -81,9 +91,34 @@ class SimpleEnvWrapper:
             self._save_debug_frame(rgb[0], f"step_{self.frame_count}")
         self.frame_count += 1
 
+        # ensure shapes
         reward = reward.reshape(-1, 1).contiguous()
         terminated = terminated.reshape(-1, 1).contiguous()
         truncated = truncated.reshape(-1, 1).contiguous()
+
+        # ---------------- REWARD CONSOLE LOGGER ----------------
+        # accumulate stats across all envs for this step
+        r = reward.view(-1)  # [B]
+        self._acc_sum += r.sum()
+        self._acc_sq_sum += (r * r).sum()
+        self._acc_count += r.numel()
+
+        self._global_step += 1
+        if (self._global_step % self._log_interval) == 0 and self._acc_count > 0:
+            mean = (self._acc_sum / self._acc_count)
+            var = (self._acc_sq_sum / self._acc_count) - (mean * mean)
+            var = torch.clamp(var, min=0.0)
+            std = torch.sqrt(var)
+            # move just the scalars to host for printing
+            if (self._global_step // self._log_interval) % 10 == 0:
+                print("\n─────────────────────────────────────────────────────────────")
+            print(f"[Step {self._global_step:7d}]  🎯 mean reward: {float(mean):8.3f} ± {float(std):6.3f}")
+
+            # reset accumulators
+            self._acc_sum.zero_()
+            self._acc_sq_sum.zero_()
+            self._acc_count = 0
+        # -------------------------------------------------------
 
         return rgb.view(self.num_envs, -1).contiguous(), reward, terminated, truncated, info
 
@@ -248,10 +283,9 @@ def train():
         }
     })
 
-    memory = RandomMemory(memory_size=ppo_cfg["rollouts"], num_envs=args.num_envs, device=device)
     agent = PPO(
         models={"policy": policy, "value": value},
-        memory=memory,
+        memory=RandomMemory(memory_size=ppo_cfg["rollouts"], num_envs=args.num_envs, device=device),
         cfg=ppo_cfg,
         observation_space=env.observation_space,
         action_space=env.action_space,
@@ -265,7 +299,7 @@ def train():
     trainer_cfg = {
         "timesteps": 200000,
         "headless": args.headless,
-        "disable_progressbar": False,
+        "disable_progressbar": True,   # ✅ disable tqdm bar
         "close_environment_at_exit": True,
     }
 
