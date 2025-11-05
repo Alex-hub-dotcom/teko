@@ -1,0 +1,10 @@
+Evaluation Results
+==================
+Timestamp: 2025-11-05T08:53:52.157993
+Model: runs/teko_ppo_20251104_204033/final_model.pt
+Episodes: 100
+
+Success Rate: 0.0%
+Collision Rate: 0.0%
+Average Reward: 982.66
+Average Final Distance: 1.007m

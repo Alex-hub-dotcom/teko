@@ -1,249 +1,287 @@
-# Copyright (c) 2022-2025, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
-# All rights reserved.
-#
-# SPDX-License-Identifier: BSD-3-Clause
-
+#!/usr/bin/env python3
 """
-Script to play a checkpoint of an RL agent from skrl.
-
-Visit the skrl documentation (https://skrl.readthedocs.io) to see the examples structured in
-a more user-friendly way.
+Evaluate Trained TEKO Docking Policy
+====================================
+Tests the trained model and reports success rate, average rewards, etc.
 """
 
-"""Launch Isaac Sim Simulator first."""
-
+from isaacsim import SimulationApp
 import argparse
-import sys
 
-from isaaclab.app import AppLauncher
+parser = argparse.ArgumentParser()
+parser.add_argument("--model_path", type=str, required=True, help="Path to trained model")
+parser.add_argument("--num_episodes", type=int, default=50, help="Number of test episodes")
+parser.add_argument("--headless", action="store_true", help="Run without visualization")
+parser.add_argument("--render_video", action="store_true", help="Save video of episodes")
+args = parser.parse_args()
 
-# add argparse arguments
-parser = argparse.ArgumentParser(description="Play a checkpoint of an RL agent from skrl.")
-parser.add_argument("--video", action="store_true", default=False, help="Record videos during training.")
-parser.add_argument("--video_length", type=int, default=200, help="Length of the recorded video (in steps).")
-parser.add_argument(
-    "--disable_fabric", action="store_true", default=False, help="Disable fabric and use USD I/O operations."
-)
-parser.add_argument("--num_envs", type=int, default=None, help="Number of environments to simulate.")
-parser.add_argument("--task", type=str, default=None, help="Name of the task.")
-parser.add_argument(
-    "--agent",
-    type=str,
-    default=None,
-    help=(
-        "Name of the RL agent configuration entry point. Defaults to None, in which case the argument "
-        "--algorithm is used to determine the default agent configuration entry point."
-    ),
-)
-parser.add_argument("--checkpoint", type=str, default=None, help="Path to model checkpoint.")
-parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment")
-parser.add_argument(
-    "--use_pretrained_checkpoint",
-    action="store_true",
-    help="Use the pre-trained checkpoint from Nucleus.",
-)
-parser.add_argument(
-    "--ml_framework",
-    type=str,
-    default="torch",
-    choices=["torch", "jax", "jax-numpy"],
-    help="The ML framework used for training the skrl agent.",
-)
-parser.add_argument(
-    "--algorithm",
-    type=str,
-    default="PPO",
-    choices=["AMP", "PPO", "IPPO", "MAPPO"],
-    help="The RL algorithm used for training the skrl agent.",
-)
-parser.add_argument("--real-time", action="store_true", default=False, help="Run in real-time, if possible.")
+simulation_app = SimulationApp({"headless": args.headless})
 
-# append AppLauncher cli args
-AppLauncher.add_app_launcher_args(parser)
-# parse the arguments
-args_cli, hydra_args = parser.parse_known_args()
-# always enable cameras to record video
-if args_cli.video:
-    args_cli.enable_cameras = True
-
-# clear out sys.argv for Hydra
-sys.argv = [sys.argv[0]] + hydra_args
-# launch omniverse app
-app_launcher = AppLauncher(args_cli)
-simulation_app = app_launcher.app
-
-"""Rest everything follows."""
-
-import gymnasium as gym
-import os
-import random
-import time
 import torch
+import numpy as np
+from datetime import datetime
 
-import skrl
-from packaging import version
+from source.teko.teko.tasks.direct.teko.teko_env import TekoEnv
+from source.teko.teko.tasks.direct.teko.teko_env_cfg import TekoEnvCfg
+from skrl.agents.torch.ppo import PPO, PPO_DEFAULT_CONFIG
+from skrl.memories.torch import RandomMemory
+from skrl.models.torch import DeterministicMixin, GaussianMixin, Model
+import gymnasium as gym
+from source.teko.teko.tasks.direct.teko.agents.cnn_model import create_visual_encoder
 
-# check for minimum supported skrl version
-SKRL_VERSION = "1.4.3"
-if version.parse(skrl.__version__) < version.parse(SKRL_VERSION):
-    skrl.logger.error(
-        f"Unsupported skrl version: {skrl.__version__}. "
-        f"Install supported version using 'pip install skrl>={SKRL_VERSION}'"
-    )
-    exit()
+print("\n" + "="*70)
+print("🔍 TEKO Docking Policy Evaluation")
+print("="*70 + "\n")
 
-if args_cli.ml_framework.startswith("torch"):
-    from skrl.utils.runner.torch import Runner
-elif args_cli.ml_framework.startswith("jax"):
-    from skrl.utils.runner.jax import Runner
+# =====================================================================
+# Wrapper (same as training)
+# =====================================================================
+class SimpleEnvWrapper:
+    def __init__(self, env):
+        self.env = env
+        self.num_envs = 1  # Single env for evaluation
+        self.num_agents = 1
+        self.device = getattr(env, "device", "cuda:0")
 
-from isaaclab.envs import (
-    DirectMARLEnv,
-    DirectMARLEnvCfg,
-    DirectRLEnvCfg,
-    ManagerBasedRLEnvCfg,
-    multi_agent_to_single_agent,
-)
-from isaaclab.utils.dict import print_dict
-from isaaclab.utils.pretrained_checkpoint import get_published_pretrained_checkpoint
+        H, W = env.cfg.camera.height, env.cfg.camera.width
+        self.H, self.W, self.C = H, W, 3
+        self.flat_dim = self.C * H * W
 
-from isaaclab_rl.skrl import SkrlVecEnvWrapper
+        self.observation_space = gym.spaces.Box(low=0, high=1, shape=(self.flat_dim,), dtype=np.float32)
+        self.action_space = gym.spaces.Box(low=-1.0, high=1.0, shape=(2,), dtype=np.float32)
 
-import isaaclab_tasks  # noqa: F401
-from isaaclab_tasks.utils import get_checkpoint_path
-from isaaclab_tasks.utils.hydra import hydra_task_config
+    def reset(self):
+        obs, info = self.env.reset()
+        rgb = self._extract_rgb(obs).to(self.device).float()
+        return rgb.view(self.num_envs, -1).contiguous(), info
 
-import teko.tasks  # noqa: F401
+    def step(self, action):
+        if not isinstance(action, torch.Tensor):
+            action = torch.as_tensor(action, dtype=torch.float32)
+        if action.ndim == 1:
+            action = action.unsqueeze(0)
+        action = action.to(self.device)
 
-# config shortcuts
-if args_cli.agent is None:
-    algorithm = args_cli.algorithm.lower()
-    agent_cfg_entry_point = "skrl_cfg_entry_point" if algorithm in ["ppo"] else f"skrl_{algorithm}_cfg_entry_point"
-else:
-    agent_cfg_entry_point = args_cli.agent
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        rgb = self._extract_rgb(obs).to(self.device).float()
+        
+        reward = reward.reshape(-1, 1).contiguous()
+        terminated = terminated.reshape(-1, 1).contiguous()
+        truncated = truncated.reshape(-1, 1).contiguous()
+
+        return rgb.view(self.num_envs, -1).contiguous(), reward, terminated, truncated, info
+
+    def _extract_rgb(self, obs):
+        if isinstance(obs, dict):
+            if "policy" in obs and isinstance(obs["policy"], dict):
+                return obs["policy"]["rgb"]
+            elif "rgb" in obs:
+                return obs["rgb"]
+        return obs
+
+    def render(self):
+        pass
+
+    def close(self):
+        self.env.close()
 
 
-@hydra_task_config(args_cli.task, agent_cfg_entry_point)
-def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, experiment_cfg: dict):
-    """Play with skrl agent."""
-    # grab task name for checkpoint path
-    task_name = args_cli.task.split(":")[-1]
-    train_task_name = task_name.replace("-Play", "")
-
-    # override configurations with non-hydra CLI arguments
-    env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
-    env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
-
-    # configure the ML framework into the global skrl variable
-    if args_cli.ml_framework.startswith("jax"):
-        skrl.config.jax.backend = "jax" if args_cli.ml_framework == "jax" else "numpy"
-
-        # randomly sample a seed if seed = -1
-    if args_cli.seed == -1:
-        args_cli.seed = random.randint(0, 10000)
-
-    # set the agent and environment seed from command line
-    # note: certain randomization occur in the environment initialization so we set the seed here
-    experiment_cfg["seed"] = args_cli.seed if args_cli.seed is not None else experiment_cfg["seed"]
-    env_cfg.seed = experiment_cfg["seed"]
-
-    # specify directory for logging experiments (load checkpoint)
-    log_root_path = os.path.join("logs", "skrl", experiment_cfg["agent"]["experiment"]["directory"])
-    log_root_path = os.path.abspath(log_root_path)
-    print(f"[INFO] Loading experiment from directory: {log_root_path}")
-    # get checkpoint path
-    if args_cli.use_pretrained_checkpoint:
-        resume_path = get_published_pretrained_checkpoint("skrl", train_task_name)
-        if not resume_path:
-            print("[INFO] Unfortunately a pre-trained checkpoint is currently unavailable for this task.")
-            return
-    elif args_cli.checkpoint:
-        resume_path = os.path.abspath(args_cli.checkpoint)
-    else:
-        resume_path = get_checkpoint_path(
-            log_root_path, run_dir=f".*_{algorithm}_{args_cli.ml_framework}", other_dirs=["checkpoints"]
+# =====================================================================
+# Models (same as training)
+# =====================================================================
+class PolicyNetwork(GaussianMixin, Model):
+    def __init__(self, observation_space, action_space, device, **kwargs):
+        Model.__init__(self, observation_space, action_space, device)
+        GaussianMixin.__init__(self, **kwargs)
+        self.C, self.H, self.W = 3, 480, 640
+        self.encoder = create_visual_encoder("simple", feature_dim=256, pretrained=False)
+        self.policy = torch.nn.Sequential(
+            torch.nn.Linear(256, 128), torch.nn.ReLU(),
+            torch.nn.Linear(128, 64), torch.nn.ReLU(),
+            torch.nn.Linear(64, self.num_actions), torch.nn.Tanh()
         )
-    log_dir = os.path.dirname(os.path.dirname(resume_path))
+        self.log_std = torch.nn.Parameter(torch.zeros(self.num_actions))
 
-    # set the log directory for the environment (works for all environment types)
-    env_cfg.log_dir = log_dir
+    def compute(self, inputs, role):
+        x = inputs["states"]
+        x = x.view(x.shape[0], self.C, self.H, self.W)
+        feat = self.encoder(x)
+        act = self.policy(feat)
+        return act, self.log_std, {}
 
-    # create isaac environment
-    env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
 
-    # convert to single-agent instance if required by the RL algorithm
-    if isinstance(env.unwrapped, DirectMARLEnv) and algorithm in ["ppo"]:
-        env = multi_agent_to_single_agent(env)
+class ValueNetwork(DeterministicMixin, Model):
+    def __init__(self, observation_space, action_space, device, **kwargs):
+        Model.__init__(self, observation_space, action_space, device)
+        DeterministicMixin.__init__(self, **kwargs)
+        self.C, self.H, self.W = 3, 480, 640
+        self.encoder = create_visual_encoder("simple", feature_dim=256, pretrained=False)
+        self.value = torch.nn.Sequential(
+            torch.nn.Linear(256, 128), torch.nn.ReLU(),
+            torch.nn.Linear(128, 64), torch.nn.ReLU(),
+            torch.nn.Linear(64, 1)
+        )
 
-    # get environment (step) dt for real-time evaluation
-    try:
-        dt = env.step_dt
-    except AttributeError:
-        dt = env.unwrapped.step_dt
+    def compute(self, inputs, role):
+        x = inputs["states"]
+        x = x.view(x.shape[0], self.C, self.H, self.W)
+        feat = self.encoder(x)
+        return self.value(feat), {}
 
-    # wrap for video recording
-    if args_cli.video:
-        video_kwargs = {
-            "video_folder": os.path.join(log_dir, "videos", "play"),
-            "step_trigger": lambda step: step == 0,
-            "video_length": args_cli.video_length,
-            "disable_logger": True,
-        }
-        print("[INFO] Recording videos during training.")
-        print_dict(video_kwargs, nesting=4)
-        env = gym.wrappers.RecordVideo(env, **video_kwargs)
 
-    # wrap around environment for skrl
-    env = SkrlVecEnvWrapper(env, ml_framework=args_cli.ml_framework)  # same as: `wrap_env(env, wrapper="auto")`
+# =====================================================================
+# Evaluation
+# =====================================================================
+def evaluate():
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    print(f"Device: {device}")
+    print(f"Model: {args.model_path}")
+    print(f"Episodes: {args.num_episodes}\n")
 
-    # configure and instantiate the skrl runner
-    # https://skrl.readthedocs.io/en/latest/api/utils/runner.html
-    experiment_cfg["trainer"]["close_environment_at_exit"] = False
-    experiment_cfg["agent"]["experiment"]["write_interval"] = 0  # don't log to TensorBoard
-    experiment_cfg["agent"]["experiment"]["checkpoint_interval"] = 0  # don't generate checkpoints
-    runner = Runner(env, experiment_cfg)
+    # Create environment (single env for evaluation)
+    env_cfg = TekoEnvCfg()
+    env_cfg.scene.num_envs = 1
+    env_cfg.sim.device = str(device)
+    env = TekoEnv(cfg=env_cfg, render_mode=None if args.headless else "human")
 
-    print(f"[INFO] Loading model checkpoint from: {resume_path}")
-    runner.agent.load(resume_path)
-    # set agent to evaluation mode
-    runner.agent.set_running_mode("eval")
+    # Warm-up
+    for _ in range(10):
+        env.sim.step()
+    env._init_observation_space()
+    _ = env.reset()
 
-    # reset environment
-    obs, _ = env.reset()
-    timestep = 0
-    # simulate environment
-    while simulation_app.is_running():
-        start_time = time.time()
+    env = SimpleEnvWrapper(env)
+    print("✓ Environment created")
 
-        # run everything in inference mode
-        with torch.inference_mode():
-            # agent stepping
-            outputs = runner.agent.act(obs, timestep=0, timesteps=0)
-            # - multi-agent (deterministic) actions
-            if hasattr(env, "possible_agents"):
-                actions = {a: outputs[-1][a].get("mean_actions", outputs[0][a]) for a in env.possible_agents}
-            # - single-agent (deterministic) actions
-            else:
-                actions = outputs[-1].get("mean_actions", outputs[0])
-            # env stepping
-            obs, _, _, _, _ = env.step(actions)
-        if args_cli.video:
-            timestep += 1
-            # exit the play loop after recording one video
-            if timestep == args_cli.video_length:
-                break
+    # Create agent and load model
+    policy = PolicyNetwork(env.observation_space, env.action_space, device)
+    value = ValueNetwork(env.observation_space, env.action_space, device)
+    
+    ppo_cfg = PPO_DEFAULT_CONFIG.copy()
+    memory = RandomMemory(memory_size=16, num_envs=1, device=device)
+    
+    agent = PPO(
+        models={"policy": policy, "value": value},
+        memory=memory,
+        cfg=ppo_cfg,
+        observation_space=env.observation_space,
+        action_space=env.action_space,
+        device=device,
+    )
+    
+    # Load trained weights
+    print(f"Loading model from: {args.model_path}")
+    agent.load(args.model_path)
+    print("✓ Model loaded\n")
 
-        # time delay for real-time evaluation
-        sleep_time = dt - (time.time() - start_time)
-        if args_cli.real_time and sleep_time > 0:
-            time.sleep(sleep_time)
+    # Evaluation metrics
+    successes = 0
+    collisions = 0
+    out_of_bounds = 0
+    episode_rewards = []
+    episode_lengths = []
+    final_distances = []
 
-    # close the simulator
+    print("="*70)
+    print("Running evaluation...")
+    print("="*70 + "\n")
+
+    for episode in range(args.num_episodes):
+        obs, info = env.reset()
+        done = False
+        episode_reward = 0
+        steps = 0
+        
+        while not done:
+            # Get action from policy (deterministic = no exploration)
+            with torch.no_grad():
+                action, _, _ = agent.act(obs, timestep=0, timesteps=1)
+            
+            obs, reward, terminated, truncated, info = env.step(action)
+            
+            episode_reward += reward.item()
+            steps += 1
+            done = terminated.item() or truncated.item()
+            
+            # Update visualization
+            if not args.headless:
+                simulation_app.update()
+        
+        # Get final state
+        robot_pos = env.env.robot.data.root_pos_w[0].cpu().numpy()
+        goal_pos = env.env.goal_positions[0].cpu().numpy()
+        final_distance = np.linalg.norm(robot_pos - goal_pos)
+        
+        # Check termination reason
+        target_distance = 0.43
+        tolerance = 0.01
+        success = abs(final_distance - target_distance) < tolerance
+        collision = final_distance < 0.35
+        oob = (abs(robot_pos[0]) > 1.0) or (abs(robot_pos[1]) > 1.0)
+        
+        if success:
+            successes += 1
+            status = "✅ SUCCESS"
+        elif collision:
+            collisions += 1
+            status = "💥 COLLISION"
+        elif oob:
+            out_of_bounds += 1
+            status = "🚫 OUT OF BOUNDS"
+        else:
+            status = "❌ FAILED"
+        
+        episode_rewards.append(episode_reward)
+        episode_lengths.append(steps)
+        final_distances.append(final_distance)
+        
+        print(f"Episode {episode+1:3d}/{args.num_episodes} | "
+              f"Reward: {episode_reward:6.2f} | "
+              f"Steps: {steps:4d} | "
+              f"Dist: {final_distance:.3f}m | "
+              f"{status}")
+
+    # Print summary
+    print("\n" + "="*70)
+    print("EVALUATION SUMMARY")
+    print("="*70)
+    print(f"Total Episodes:      {args.num_episodes}")
+    print(f"Successes:           {successes} ({100*successes/args.num_episodes:.1f}%)")
+    print(f"Collisions:          {collisions} ({100*collisions/args.num_episodes:.1f}%)")
+    print(f"Out of Bounds:       {out_of_bounds} ({100*out_of_bounds/args.num_episodes:.1f}%)")
+    print(f"Other Failures:      {args.num_episodes - successes - collisions - out_of_bounds}")
+    print(f"\nAverage Reward:      {np.mean(episode_rewards):.2f} ± {np.std(episode_rewards):.2f}")
+    print(f"Average Episode Len: {np.mean(episode_lengths):.1f} ± {np.std(episode_lengths):.1f}")
+    print(f"Average Final Dist:  {np.mean(final_distances):.3f}m ± {np.std(final_distances):.3f}m")
+    print(f"Target Distance:     0.430m ± 0.010m")
+    print("="*70 + "\n")
+
+    # Save results
+    results_file = args.model_path.replace("final_model.pt", "evaluation_results.txt")
+    with open(results_file, "w") as f:
+        f.write(f"Evaluation Results\n")
+        f.write(f"==================\n")
+        f.write(f"Timestamp: {datetime.now().isoformat()}\n")
+        f.write(f"Model: {args.model_path}\n")
+        f.write(f"Episodes: {args.num_episodes}\n\n")
+        f.write(f"Success Rate: {100*successes/args.num_episodes:.1f}%\n")
+        f.write(f"Collision Rate: {100*collisions/args.num_episodes:.1f}%\n")
+        f.write(f"Average Reward: {np.mean(episode_rewards):.2f}\n")
+        f.write(f"Average Final Distance: {np.mean(final_distances):.3f}m\n")
+    
+    print(f"Results saved to: {results_file}")
+
     env.close()
 
 
 if __name__ == "__main__":
-    # run the main function
-    main()
-    # close sim app
-    simulation_app.close()
+    try:
+        evaluate()
+    except KeyboardInterrupt:
+        print("\n⚠️ Evaluation interrupted")
+    except Exception as e:
+        print(f"\n❌ Error: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        simulation_app.close()

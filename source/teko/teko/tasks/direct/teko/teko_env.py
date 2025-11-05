@@ -221,11 +221,24 @@ class TekoEnv(DirectRLEnv):
         print(f"[INFO] Initialized {len(self.cameras)} cameras.")
 
     def _cache_goal_transforms(self):
+        """Cache goal positions with proper environment offsets."""
         num_envs = self.scene.cfg.num_envs
         self.goal_positions = torch.zeros((num_envs, 3), device=self.device)
+        
+        # ✅ Get environment origins from Isaac Lab scene
+        # Each env is offset by env_spacing (6.0m in your config)
+        env_origins = self.scene.env_origins  # This is provided by Isaac Lab!
+        
         for env_idx in range(num_envs):
-            self.goal_positions[env_idx] = torch.tensor([1.0, 0.0, 0.40], device=self.device)
-        print(f"[INFO] Cached {num_envs} goal positions at (1.0, 0.0, 0.40)")
+            # Goal position RELATIVE to environment origin
+            local_goal_pos = torch.tensor([1.0, 0.0, 0.40], device=self.device)
+            # Add environment offset
+            self.goal_positions[env_idx] = env_origins[env_idx] + local_goal_pos
+        
+        print(f"[INFO] Cached {num_envs} goal positions with environment offsets")
+        print(f"[DEBUG] First goal at: {self.goal_positions[0]}")
+        if num_envs > 1:
+            print(f"[DEBUG] Second goal at: {self.goal_positions[1]}")
 
     # ------------------------------------------------------------------
     # Physics / Actions
@@ -331,7 +344,8 @@ class TekoEnv(DirectRLEnv):
         distance = torch.norm(robot_pos - goal_pos, dim=-1)
         target_distance = 0.43  # 43cm from ground truth
         distance_error = torch.abs(distance - target_distance)
-        distance_reward = 10.0 * torch.exp(-distance_error / 0.05)
+        # ✅ Make this the PRIMARY reward
+        distance_reward = 20.0 * torch.exp(-distance_error / 0.05)  # Increased from 10.0
         
         # === 2. Y-Axis Alignment (lateral centering) ===
         y_error = torch.abs(robot_pos[:, 1] - goal_pos[:, 1])
@@ -353,15 +367,20 @@ class TekoEnv(DirectRLEnv):
         # === 5. Wall Boundary Penalty ===
         wall_penalty = self._compute_wall_penalty()
         
-        # === 6. Progress Reward (moving toward goal) ===
-        progress_reward = self._compute_progress_reward()
+        # === 6. Simple approach incentive (NOT cumulative) ===
+        # Give small bonus for being closer than starting distance
+        approach_bonus = torch.where(
+            distance < 1.0,  # If closer than 1m
+            torch.tensor(2.0, device=self.device),
+            torch.tensor(0.0, device=self.device)
+        )
         
-        # === Total Reward ===
+        # === Total Reward (NO unbounded progress reward) ===
         total_reward = (
             distance_reward 
             + y_reward 
             + yaw_reward 
-            + progress_reward
+            + approach_bonus
             - collision_penalty 
             - wall_penalty
         )
@@ -407,7 +426,7 @@ class TekoEnv(DirectRLEnv):
         return penalty
 
     def _compute_progress_reward(self):
-        """Reward moving toward goal."""
+        """Reward moving toward goal (capped to prevent exploitation)."""
         if self.prev_robot_pos is None:
             self.prev_robot_pos = self.robot.data.root_pos_w.clone()
             return torch.zeros(self.scene.cfg.num_envs, device=self.device)
@@ -419,7 +438,8 @@ class TekoEnv(DirectRLEnv):
         curr_dist = torch.norm(curr_pos - goal_pos, dim=-1)
         
         progress = prev_dist - curr_dist
-        progress_reward = progress * 2.0  # Scale factor
+        # ✅ Cap progress reward to prevent exploitation
+        progress_reward = torch.clamp(progress * 2.0, -1.0, 1.0)
         
         self.prev_robot_pos = curr_pos.clone()
         
@@ -489,7 +509,8 @@ class TekoEnv(DirectRLEnv):
         # Calculate position
         spawn_x = self.goal_positions[env_ids, 0] - spawn_distance
         spawn_y = self.goal_positions[env_ids, 1]
-        spawn_z = torch.ones(num_reset, device=self.device) * 0.43
+        # ✅ FIX: Use same Z as goal (0.40m) + small offset for robot height
+        spawn_z = torch.ones(num_reset, device=self.device) * 0.40  # Match goal Z
         
         spawn_pos = torch.stack([spawn_x, spawn_y, spawn_z], dim=1)
         spawn_quat = self._yaw_to_quat(spawn_yaw)
@@ -511,7 +532,8 @@ class TekoEnv(DirectRLEnv):
         
         spawn_x = self.goal_positions[env_ids, 0] - spawn_distance
         spawn_y = self.goal_positions[env_ids, 1] + (torch.rand(num_reset, device=self.device) * 0.4 - 0.2)
-        spawn_z = torch.ones(num_reset, device=self.device) * 0.43
+        # ✅ FIX: Use same Z as goal
+        spawn_z = torch.ones(num_reset, device=self.device) * 0.40
         
         spawn_pos = torch.stack([spawn_x, spawn_y, spawn_z], dim=1)
         spawn_quat = self._yaw_to_quat(spawn_yaw)
@@ -528,7 +550,8 @@ class TekoEnv(DirectRLEnv):
         # Random position in arena (avoiding goal region)
         spawn_x = torch.rand(num_reset, device=self.device) * (self.arena_size - 0.5) - (self.arena_size/2 - 0.25)
         spawn_y = torch.rand(num_reset, device=self.device) * (self.arena_size - 0.5) - (self.arena_size/2 - 0.25)
-        spawn_z = torch.ones(num_reset, device=self.device) * 0.43
+        # ✅ FIX: Use same Z as goal
+        spawn_z = torch.ones(num_reset, device=self.device) * 0.40
         
         # Random orientation
         spawn_yaw = torch.rand(num_reset, device=self.device) * 2 * np.pi
