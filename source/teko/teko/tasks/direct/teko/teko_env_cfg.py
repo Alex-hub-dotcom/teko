@@ -74,7 +74,7 @@ class TekoEnvCfg(DirectRLEnvCfg):
     # Using max of linear and angular requirements
     
     action_scale = 1.0
-    max_wheel_speed = 2.5  # rad/s (conservative, based on 0.08 m/s linear)
+    max_wheel_speed = 0.2 # rad/s (conservative, based on 0.08 m/s linear)
     wheel_polarity = [1.0, -1.0, 1.0, -1.0]  # Polarity for differential drive
     
     # --- Camera configuration -----------------------------------------

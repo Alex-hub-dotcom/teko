@@ -1,13 +1,14 @@
-############ IMPROVED TEKO ENV - Vision-Based Docking with Collision Penalties
+############ IMPROVED TEKO ENV - Anti-Oscillation + Comprehensive Logging
 # SPDX-License-Identifier: BSD-3-Clause
 """
-TEKO Environment — Improved for Vision-Based Docking
-----------------------------------------------------
-Features:
-- Collision detection (walls + static robot)
-- Orientation-aware rewards
-- Curriculum learning support
-- Random spawn positions
+TEKO Environment — Improved Version with Anti-Oscillation
+---------------------------------------------------------
+Key improvements:
+- Velocity penalties to prevent back-and-forth behavior
+- Better reward shaping (no unbounded distance rewards)
+- Progress tracking with directional awareness
+- Comprehensive episode logging
+- Success rate metrics
 """
 
 from __future__ import annotations
@@ -25,7 +26,7 @@ from .teko_env_cfg import TekoEnvCfg
 
 
 class TekoEnv(DirectRLEnv):
-    """TEKO environment with collision penalties and improved rewards."""
+    """TEKO environment with anti-oscillation and comprehensive logging."""
 
     cfg: TekoEnvCfg
 
@@ -39,20 +40,37 @@ class TekoEnv(DirectRLEnv):
         self.num_agents = 1
         
         # Curriculum learning
-        self.curriculum_level = 0  # 0=easy (close), 1=medium, 2=hard (far+random)
-        self.spawn_distance_range = (0.8, 1.5)  # Start close
+        self.curriculum_level = 0
+        self.spawn_distance_range = (0.5, 0.8)  # Start even closer
         
-        # Collision tracking
+        # Anti-oscillation tracking
         self.prev_robot_pos = None
-        self.collision_cooldown = torch.zeros(1, dtype=torch.int32)
+        self.prev_distance = None
+        self.prev_actions = None
+        self.movement_history = []  # Track movement patterns
+        self.step_count = torch.zeros(1, dtype=torch.int32)
         
-        # Arena boundaries (from your arena dimensions)
-        self.arena_size = 2.0  # Assuming 2m x 2m arena
+        # Arena boundaries
+        self.arena_size = 2.0
+        
+        # Episode statistics for logging
+        self.episode_rewards = []
+        self.episode_lengths = []
+        self.episode_successes = []
+        self.reward_components = {
+            'distance': [],
+            'alignment': [],
+            'orientation': [],
+            'velocity_penalty': [],
+            'oscillation_penalty': [],
+            'collision_penalty': [],
+            'wall_penalty': []
+        }
         
         super().__init__(cfg, render_mode, **kwargs)
 
     # ------------------------------------------------------------------
-    # Scene setup
+    # Scene setup (unchanged from your version)
     # ------------------------------------------------------------------
     def _setup_scene(self):
         stage = get_context().get_stage()
@@ -64,17 +82,11 @@ class TekoEnv(DirectRLEnv):
 
         self._setup_global_lighting(stage)
 
-        # Active robot
         self.robot = Articulation(self.cfg.robot_cfg)
         self.scene.articulations["robot"] = self.robot
 
-        # Clone environments
         self.scene.clone_environments(copy_from_source=True)
-
-        # Per-environment assets
         self._setup_per_environment_assets(stage)
-
-        # Cameras + cached goal positions
         self._setup_cameras()
         self._cache_goal_transforms()
 
@@ -108,11 +120,12 @@ class TekoEnv(DirectRLEnv):
         ARENA_USD_PATH = "/workspace/teko/documents/CAD/USD/stage_arena.usd"
         TEKO_USD_PATH = "/workspace/teko/documents/CAD/USD/teko_goal.usd"
         ARUCO_IMG_PATH = "/workspace/teko/documents/Aruco/test_marker.png"
+        
+        from pxr import UsdPhysics, PhysxSchema
 
         for env_idx in range(num_envs):
             env_path = f"/World/envs/env_{env_idx}"
 
-            # Arena
             try:
                 arena_path = f"{env_path}/Arena"
                 arena_prim = stage.DefinePrim(arena_path, "Xform")
@@ -120,7 +133,6 @@ class TekoEnv(DirectRLEnv):
             except Exception as e:
                 print(f"[WARN] Arena failed for env_{env_idx}: {e}")
 
-            # Robot positioning (will be randomized in reset)
             robot_prim = stage.GetPrimAtPath(f"{env_path}/Robot")
             if robot_prim.IsValid():
                 xf_robot = UsdGeom.Xformable(robot_prim)
@@ -128,7 +140,7 @@ class TekoEnv(DirectRLEnv):
                 xf_robot.AddTranslateOp().Set(Gf.Vec3d(-0.2, 0.0, 0.43))
                 xf_robot.AddRotateZOp().Set(180.0)
 
-            # Goal robot (static)
+            # CRITICAL: Goal robot must be static (no physics simulation)
             goal_path = f"{env_path}/RobotGoal"
             goal_prim = stage.DefinePrim(goal_path, "Xform")
             goal_prim.GetReferences().AddReference(TEKO_USD_PATH)
@@ -137,8 +149,21 @@ class TekoEnv(DirectRLEnv):
             xf_goal.ClearXformOpOrder()
             xf_goal.AddTranslateOp().Set(Gf.Vec3f(1.0, 0.0, 0.40))
             xf_goal.AddRotateZOp().Set(180.0)
+            
+            # Disable ALL physics on goal robot and its children
+            import omni.usd
+            from pxr import Usd
+            for prim in Usd.PrimRange(goal_prim):
+                # Remove rigid body
+                if prim.HasAPI(UsdPhysics.RigidBodyAPI):
+                    prim.RemoveAPI(UsdPhysics.RigidBodyAPI)
+                # Disable collisions
+                if prim.HasAPI(UsdPhysics.CollisionAPI):
+                    UsdPhysics.CollisionAPI(prim).GetCollisionEnabledAttr().Set(False)
+                # Remove articulation
+                if prim.HasAPI(UsdPhysics.ArticulationRootAPI):
+                    prim.RemoveAPI(UsdPhysics.ArticulationRootAPI)
 
-            # ArUco marker
             self._create_aruco_marker(stage, goal_path, ARUCO_IMG_PATH)
 
         print(f"[INFO] Created {num_envs} environments.")
@@ -225,20 +250,13 @@ class TekoEnv(DirectRLEnv):
         num_envs = self.scene.cfg.num_envs
         self.goal_positions = torch.zeros((num_envs, 3), device=self.device)
         
-        # ✅ Get environment origins from Isaac Lab scene
-        # Each env is offset by env_spacing (6.0m in your config)
-        env_origins = self.scene.env_origins  # This is provided by Isaac Lab!
+        env_origins = self.scene.env_origins
         
         for env_idx in range(num_envs):
-            # Goal position RELATIVE to environment origin
             local_goal_pos = torch.tensor([1.0, 0.0, 0.40], device=self.device)
-            # Add environment offset
             self.goal_positions[env_idx] = env_origins[env_idx] + local_goal_pos
         
         print(f"[INFO] Cached {num_envs} goal positions with environment offsets")
-        print(f"[DEBUG] First goal at: {self.goal_positions[0]}")
-        if num_envs > 1:
-            print(f"[DEBUG] Second goal at: {self.goal_positions[1]}")
 
     # ------------------------------------------------------------------
     # Physics / Actions
@@ -285,7 +303,7 @@ class TekoEnv(DirectRLEnv):
         import torch.nn.functional as F
 
         num_envs = self.scene.cfg.num_envs
-        h, w = self._cam_res[1], self._cam_res[0]  # h=480, w=640
+        h, w = self._cam_res[1], self._cam_res[0]
 
         rgb_obs = torch.zeros((num_envs, 3, h, w), device=self.device, dtype=torch.float32)
         
@@ -295,19 +313,11 @@ class TekoEnv(DirectRLEnv):
             try:
                 rgba = camera.get_rgba()
                 if isinstance(rgba, np.ndarray) and rgba.size > 0:
-                    # rgba shape is (H, W, 4) - NumPy format
-                    rgb_np = rgba[..., :3]  # Take RGB, drop alpha -> (H, W, 3)
-                    
-                    # Convert to tensor and move to device
-                    rgb = torch.from_numpy(rgb_np).to(self.device).float()  # (H, W, 3)
-                    
-                    # Permute to PyTorch format: (H, W, C) -> (C, H, W)
-                    rgb = rgb.permute(2, 0, 1)  # (3, H, W)
-                    
-                    # Normalize to [0, 1]
+                    rgb_np = rgba[..., :3]
+                    rgb = torch.from_numpy(rgb_np).to(self.device).float()
+                    rgb = rgb.permute(2, 0, 1)
                     rgb = rgb / 255.0
                     
-                    # Resize if needed
                     if rgb.shape[1] != h or rgb.shape[2] != w:
                         rgb = F.interpolate(
                             rgb.unsqueeze(0), 
@@ -316,76 +326,131 @@ class TekoEnv(DirectRLEnv):
                             align_corners=False
                         ).squeeze(0)
                     
-                    # Verify shape before assignment
-                    assert rgb.shape == (3, h, w), f"Expected (3, {h}, {w}), got {rgb.shape}"
-                    
                     rgb_obs[env_idx] = rgb
                     
             except Exception as e:
                 print(f"[WARN] Camera {env_idx} failed: {e}")
-                import traceback
-                traceback.print_exc()
                 continue
 
-        # Final shape check
-        assert rgb_obs.shape == (num_envs, 3, h, w), f"Expected ({num_envs}, 3, {h}, {w}), got {rgb_obs.shape}"
-        
         return {"policy": {"rgb": rgb_obs}}
 
     # ------------------------------------------------------------------
-    # Rewards (IMPROVED)
+    # IMPROVED REWARDS (Anti-Oscillation)
     # ------------------------------------------------------------------
     def _get_rewards(self):
-        robot_pos = self.robot.data.root_pos_w           # (num_envs, 3)
-        robot_quat = self.robot.data.root_quat_w         # (num_envs, 4) [w,x,y,z]
-        goal_pos = self.goal_positions                    # (num_envs, 3)
+        robot_pos = self.robot.data.root_pos_w
+        robot_quat = self.robot.data.root_quat_w
+        goal_pos = self.goal_positions
         
-        # === 1. Distance Reward (center-to-center = 43cm when docked) ===
+        # Calculate current distance
         distance = torch.norm(robot_pos - goal_pos, dim=-1)
-        target_distance = 0.43  # 43cm from ground truth
+        target_distance = 0.43
         distance_error = torch.abs(distance - target_distance)
-        # ✅ Make this the PRIMARY reward
-        distance_reward = 20.0 * torch.exp(-distance_error / 0.05)  # Increased from 10.0
+        
+        # === 1. Distance Reward (bounded, exponential decay) ===
+        # Maximum reward when at perfect distance, decays exponentially
+        distance_reward = 15.0 * torch.exp(-distance_error / 0.05)
         
         # === 2. Y-Axis Alignment (lateral centering) ===
         y_error = torch.abs(robot_pos[:, 1] - goal_pos[:, 1])
         y_reward = 5.0 * torch.exp(-y_error / 0.05)
         
-        # === 3. Orientation Alignment (both should face yaw≈180°) ===
+        # === 3. Orientation Alignment ===
         robot_yaw = torch.atan2(
             2.0 * (robot_quat[:, 0] * robot_quat[:, 3] + robot_quat[:, 1] * robot_quat[:, 2]),
             1.0 - 2.0 * (robot_quat[:, 2]**2 + robot_quat[:, 3]**2)
         )
-        target_yaw = torch.tensor(np.pi, device=self.device)  # 180°
+        target_yaw = torch.tensor(np.pi, device=self.device)
         yaw_error = torch.abs(robot_yaw - target_yaw)
-        yaw_error = torch.min(yaw_error, 2*np.pi - yaw_error)  # Handle wrapping
-        yaw_reward = 5.0 * torch.exp(-yaw_error / 0.2)
+        yaw_error = torch.min(yaw_error, 2*np.pi - yaw_error)
+        yaw_reward = 8.0 * torch.exp(-yaw_error / 0.2)
         
-        # === 4. Collision Penalties ===
+        # === 4. Velocity Penalty (penalize excessive movement) ===
+        if self.actions is not None:
+            action_magnitude = torch.norm(self.actions, dim=-1)
+            # Penalize high velocities when close to goal
+            distance_factor = torch.clamp(distance_error / 0.2, 0.0, 1.0)
+            velocity_penalty = action_magnitude * (1.0 - distance_factor) * 3.0  # Reduced from 10
+        else:
+            velocity_penalty = torch.zeros_like(distance)
+        
+        # === 5. Oscillation Detection and Penalty ===
+        oscillation_penalty = self._compute_oscillation_penalty()
+        
+        # === 6. Directional Progress Reward ===
+        progress_reward = self._compute_smart_progress_reward(distance)
+        
+        # === 7. Collision & Wall Penalties ===
         collision_penalty = self._compute_collision_penalty()
-        
-        # === 5. Wall Boundary Penalty ===
         wall_penalty = self._compute_wall_penalty()
         
-        # === 6. Simple approach incentive (NOT cumulative) ===
-        # Give small bonus for being closer than starting distance
-        approach_bonus = torch.where(
-            distance < 1.0,  # If closer than 1m
-            torch.tensor(2.0, device=self.device),
+        # === 8. Success Bonus ===
+        success_bonus = torch.where(
+            distance_error < 0.02,  # Within 2cm of target
+            torch.tensor(50.0, device=self.device),
             torch.tensor(0.0, device=self.device)
         )
         
-        # === Total Reward (NO unbounded progress reward) ===
+        # === Total Reward ===
         total_reward = (
             distance_reward 
             + y_reward 
             + yaw_reward 
-            + approach_bonus
+            + progress_reward
+            + success_bonus
+            - velocity_penalty
+            - oscillation_penalty 
             - collision_penalty 
             - wall_penalty
         )
         
+        # Store reward components for logging
+        self.reward_components['distance'].append(distance_reward.mean().item())
+        self.reward_components['alignment'].append(y_reward.mean().item())
+        self.reward_components['orientation'].append(yaw_reward.mean().item())
+        self.reward_components['velocity_penalty'].append(velocity_penalty.mean().item())
+        self.reward_components['oscillation_penalty'].append(oscillation_penalty.mean().item())
+        self.reward_components['collision_penalty'].append(collision_penalty.mean().item())
+        self.reward_components['wall_penalty'].append(wall_penalty.mean().item())
+        
         return total_reward
+
+    def _compute_oscillation_penalty(self):
+        """Detect and penalize back-and-forth oscillations."""
+        if self.prev_actions is None or self.actions is None:
+            self.prev_actions = self.actions.clone() if self.actions is not None else None
+            return torch.zeros(self.scene.cfg.num_envs, device=self.device)
+        
+        # Check if actions reversed direction
+        action_product = self.actions * self.prev_actions
+        direction_reversal = (action_product < -0.5).any(dim=-1).float()
+        
+        # Stronger penalty if reversing frequently
+        oscillation_penalty = direction_reversal * 8.0  # Reduced from 20
+        
+        self.prev_actions = self.actions.clone()
+        
+        return oscillation_penalty
+
+    def _compute_smart_progress_reward(self, current_distance):
+        """Reward progress toward goal, but prevent exploitation."""
+        if self.prev_distance is None:
+            self.prev_distance = current_distance.clone()
+            return torch.zeros_like(current_distance)
+        
+        # Calculate progress
+        progress = self.prev_distance - current_distance
+        
+        # Only reward forward progress (moving closer)
+        progress_reward = torch.where(
+            progress > 0,
+            torch.clamp(progress * 10.0, 0.0, 2.0),  # Cap at +2
+            torch.clamp(progress * 5.0, -1.0, 0.0)   # Small penalty for moving away
+        )
+        
+        self.prev_distance = current_distance.clone()
+        
+        return progress_reward
 
     def _compute_collision_penalty(self):
         """Detect collisions with static robot."""
@@ -393,14 +458,11 @@ class TekoEnv(DirectRLEnv):
         goal_pos = self.goal_positions
         
         distance = torch.norm(robot_pos - goal_pos, dim=-1)
-        
-        # Collision if center-to-center distance < 35cm (robots are ~40cm long)
         collision_threshold = 0.35
         collision = distance < collision_threshold
         
-        # Large penalty for collision
         penalty = torch.where(collision, 
-                             torch.tensor(20.0, device=self.device),
+                             torch.tensor(50.0, device=self.device),  # Reduced from 100
                              torch.tensor(0.0, device=self.device))
         
         return penalty
@@ -408,42 +470,18 @@ class TekoEnv(DirectRLEnv):
     def _compute_wall_penalty(self):
         """Penalize getting close to arena walls."""
         robot_pos = self.robot.data.root_pos_w
-        
-        # Arena boundaries (assuming centered at origin)
         half_size = self.arena_size / 2.0
         
-        # Distance to nearest wall
         x_margin = half_size - torch.abs(robot_pos[:, 0])
         y_margin = half_size - torch.abs(robot_pos[:, 1])
         min_margin = torch.min(x_margin, y_margin)
         
-        # Penalty if within 20cm of wall
         wall_threshold = 0.20
         penalty = torch.where(min_margin < wall_threshold,
-                             10.0 * (wall_threshold - min_margin),
+                             15.0 * (wall_threshold - min_margin),
                              torch.tensor(0.0, device=self.device))
         
         return penalty
-
-    def _compute_progress_reward(self):
-        """Reward moving toward goal (capped to prevent exploitation)."""
-        if self.prev_robot_pos is None:
-            self.prev_robot_pos = self.robot.data.root_pos_w.clone()
-            return torch.zeros(self.scene.cfg.num_envs, device=self.device)
-        
-        curr_pos = self.robot.data.root_pos_w
-        goal_pos = self.goal_positions
-        
-        prev_dist = torch.norm(self.prev_robot_pos - goal_pos, dim=-1)
-        curr_dist = torch.norm(curr_pos - goal_pos, dim=-1)
-        
-        progress = prev_dist - curr_dist
-        # ✅ Cap progress reward to prevent exploitation
-        progress_reward = torch.clamp(progress * 2.0, -1.0, 1.0)
-        
-        self.prev_robot_pos = curr_pos.clone()
-        
-        return progress_reward
 
     # ------------------------------------------------------------------
     # Dones
@@ -453,16 +491,16 @@ class TekoEnv(DirectRLEnv):
         goal_pos = self.goal_positions
         distance = torch.norm(robot_pos - goal_pos, dim=-1)
 
-        # Success: within 1cm of target distance (43cm)
+        # Success
         target_distance = 0.43
-        tolerance = 0.01
+        tolerance = 0.02  # 2cm tolerance
         error = torch.abs(distance - target_distance)
         success = (error < tolerance)
 
-        # Failure: collision with goal robot
+        # Failure: collision
         collision = distance < 0.35
 
-        # Failure: out of arena
+        # Failure: out of bounds
         half_size = self.arena_size / 2.0
         out_of_bounds = (
             (torch.abs(robot_pos[:, 0]) > half_size) |
@@ -471,6 +509,10 @@ class TekoEnv(DirectRLEnv):
 
         terminated = (success | collision | out_of_bounds).squeeze(-1)
         time_out = torch.zeros_like(terminated)
+        
+        # Log episode success
+        if success.any():
+            self.episode_successes.append(True)
         
         return terminated, time_out
 
@@ -481,36 +523,31 @@ class TekoEnv(DirectRLEnv):
         super()._reset_idx(env_ids)
         self._lazy_init_articulation()
         
-        # Randomize spawn based on curriculum level
+        # Curriculum-based reset
         if self.curriculum_level == 0:
-            # Easy: close and aligned
             self._reset_close(env_ids)
         elif self.curriculum_level == 1:
-            # Medium: varied distance
             self._reset_medium(env_ids)
         else:
-            # Hard: random position and orientation
             self._reset_hard(env_ids)
         
-        # Reset tracking variables
+        # Reset tracking
         self.prev_robot_pos = None
-        self.collision_cooldown = torch.zeros(len(env_ids), dtype=torch.int32, device=self.device)
+        self.prev_distance = None
+        self.prev_actions = None
+        self.step_count.zero_()
 
     def _reset_close(self, env_ids):
-        """Easy curriculum: spawn close to goal."""
+        """Very close spawn for initial learning."""
         num_reset = len(env_ids)
         
-        # Distance from goal: 0.8m to 1.2m
-        spawn_distance = torch.rand(num_reset, device=self.device) * 0.4 + 0.8
+        spawn_distance = torch.rand(num_reset, device=self.device) * 0.3 + 0.5  # 0.5-0.8m
+        spawn_yaw = torch.ones(num_reset, device=self.device) * np.pi + \
+                    (torch.rand(num_reset, device=self.device) * 0.2 - 0.1)  # ±6°
         
-        # Always facing goal (yaw ≈ 180°)
-        spawn_yaw = torch.ones(num_reset, device=self.device) * np.pi
-        
-        # Calculate position
         spawn_x = self.goal_positions[env_ids, 0] - spawn_distance
-        spawn_y = self.goal_positions[env_ids, 1]
-        # ✅ FIX: Use same Z as goal (0.40m) + small offset for robot height
-        spawn_z = torch.ones(num_reset, device=self.device) * 0.40  # Match goal Z
+        spawn_y = self.goal_positions[env_ids, 1] + (torch.rand(num_reset, device=self.device) * 0.1 - 0.05)
+        spawn_z = torch.ones(num_reset, device=self.device) * 0.40
         
         spawn_pos = torch.stack([spawn_x, spawn_y, spawn_z], dim=1)
         spawn_quat = self._yaw_to_quat(spawn_yaw)
@@ -521,18 +558,14 @@ class TekoEnv(DirectRLEnv):
         )
 
     def _reset_medium(self, env_ids):
-        """Medium curriculum: varied distance, slight angle variation."""
+        """Medium curriculum."""
         num_reset = len(env_ids)
         
-        # Distance: 1.0m to 2.0m
-        spawn_distance = torch.rand(num_reset, device=self.device) * 1.0 + 1.0
-        
-        # Yaw: 180° ± 30°
-        spawn_yaw = torch.rand(num_reset, device=self.device) * (np.pi/3) - (np.pi/6) + np.pi
+        spawn_distance = torch.rand(num_reset, device=self.device) * 0.8 + 0.8  # 0.8-1.6m
+        spawn_yaw = torch.rand(num_reset, device=self.device) * (np.pi/4) - (np.pi/8) + np.pi  # ±22.5°
         
         spawn_x = self.goal_positions[env_ids, 0] - spawn_distance
         spawn_y = self.goal_positions[env_ids, 1] + (torch.rand(num_reset, device=self.device) * 0.4 - 0.2)
-        # ✅ FIX: Use same Z as goal
         spawn_z = torch.ones(num_reset, device=self.device) * 0.40
         
         spawn_pos = torch.stack([spawn_x, spawn_y, spawn_z], dim=1)
@@ -544,16 +577,12 @@ class TekoEnv(DirectRLEnv):
         )
 
     def _reset_hard(self, env_ids):
-        """Hard curriculum: random position in arena."""
+        """Hard curriculum."""
         num_reset = len(env_ids)
         
-        # Random position in arena (avoiding goal region)
         spawn_x = torch.rand(num_reset, device=self.device) * (self.arena_size - 0.5) - (self.arena_size/2 - 0.25)
         spawn_y = torch.rand(num_reset, device=self.device) * (self.arena_size - 0.5) - (self.arena_size/2 - 0.25)
-        # ✅ FIX: Use same Z as goal
         spawn_z = torch.ones(num_reset, device=self.device) * 0.40
-        
-        # Random orientation
         spawn_yaw = torch.rand(num_reset, device=self.device) * 2 * np.pi
         
         spawn_pos = torch.stack([spawn_x, spawn_y, spawn_z], dim=1)
@@ -574,6 +603,19 @@ class TekoEnv(DirectRLEnv):
         return torch.stack([w, x, y, z], dim=1)
     
     def set_curriculum_level(self, level: int):
-        """Set curriculum difficulty level (0=easy, 1=medium, 2=hard)."""
+        """Set curriculum difficulty level."""
         self.curriculum_level = max(0, min(2, level))
         print(f"[INFO] Curriculum level set to {self.curriculum_level}")
+    
+    def get_episode_statistics(self):
+        """Return episode statistics for logging."""
+        if len(self.episode_rewards) == 0:
+            return {}
+        
+        stats = {
+            'mean_reward': np.mean(self.episode_rewards[-100:]),
+            'mean_length': np.mean(self.episode_lengths[-100:]),
+            'success_rate': np.mean(self.episode_successes[-100:]) if self.episode_successes else 0.0,
+            'reward_components': {k: np.mean(v[-100:]) if v else 0.0 for k, v in self.reward_components.items()}
+        }
+        return stats

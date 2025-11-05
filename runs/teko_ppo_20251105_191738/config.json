@@ -1,0 +1,33 @@
+{
+  "timestamp": "20251105_191738",
+  "num_envs": 16,
+  "curriculum": true,
+  "ppo_config": {
+    "rollouts": "32",
+    "learning_epochs": "10",
+    "mini_batches": "4",
+    "discount_factor": "0.99",
+    "lambda": "0.95",
+    "learning_rate": "0.0003",
+    "learning_rate_scheduler": "<class 'skrl.resources.schedulers.torch.kl_adaptive.KLAdaptiveLR'>",
+    "learning_rate_scheduler_kwargs": "{'kl_threshold': 0.008, 'min_lr': 1e-05, 'max_lr': 0.001}",
+    "state_preprocessor": "None",
+    "state_preprocessor_kwargs": "{}",
+    "value_preprocessor": "None",
+    "value_preprocessor_kwargs": "{}",
+    "random_timesteps": "0",
+    "learning_starts": "0",
+    "grad_norm_clip": "0.5",
+    "ratio_clip": "0.2",
+    "value_clip": "0.2",
+    "clip_predicted_values": "True",
+    "entropy_loss_scale": "0.01",
+    "value_loss_scale": "0.5",
+    "kl_threshold": "0",
+    "rewards_shaper": "None",
+    "time_limit_bootstrap": "False",
+    "mixed_precision": "False",
+    "experiment": "{'directory': '', 'experiment_name': '', 'write_interval': 'auto', 'checkpoint_interval': 'auto', 'store_separately': False, 'wandb': False, 'wandb_kwargs': {}}"
+  },
+  "total_timesteps": 200000
+}
