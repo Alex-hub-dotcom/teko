@@ -1,41 +1,55 @@
 # SPDX-License-Identifier: BSD-3-Clause
-"""Configuration for the TEKO robot (wheel joints emulate continuous tracks)."""
+# TEKO Robot Configuration — clean and simulation-safe
+# No omni.usd or pxr imports, only Isaac Lab API calls.
 
 from __future__ import annotations
-
 import isaaclab.sim as sim_utils
 from isaaclab.assets import ArticulationCfg
 from isaaclab.actuators import ImplicitActuatorCfg
 
-# Path to the TEKO robot USD file (converted from URDF/Fusion)
 TEKO_PATH = "/workspace/teko/documents/CAD/USD/teko.usd"
 
-# Explicit joint names for the 4 wheel joints (used for tracked locomotion)
 WHEEL_JOINTS = [
-    "TEKO_Chassi_JointWheelFrontLeft",   # Front-left
-    "TEKO_Chassi_JointWheelFrontRight",  # Front-right
-    "TEKO_Chassi_JointWheelBackLeft",    # Rear-left
-    "TEKO_Chassi_JointWheelBackRight",   # Rear-right
+    "TEKO_Chassi_JointWheelFrontLeft",
+    "TEKO_Chassi_JointWheelFrontRight",
+    "TEKO_Chassi_JointWheelBackLeft",
+    "TEKO_Chassi_JointWheelBackRight",
 ]
 
-# Full Articulation configuration for the TEKO robot
 TEKO_CONFIGURATION = ArticulationCfg(
     spawn=sim_utils.UsdFileCfg(
         usd_path=TEKO_PATH,
         articulation_props=sim_utils.ArticulationRootPropertiesCfg(
             enabled_self_collisions=False,
+            solver_position_iteration_count=8,
+            solver_velocity_iteration_count=2,
+            sleep_threshold=0.005,
+            stabilization_threshold=0.001,
         ),
         activate_contact_sensors=False,
+        rigid_props=sim_utils.RigidBodyPropertiesCfg(
+            disable_gravity=False,
+            linear_damping=0.01,
+            angular_damping=0.05,
+        ),
+        collision_props=sim_utils.CollisionPropertiesCfg(
+            contact_offset=0.002,
+            rest_offset=0.0,
+            torsional_patch_radius=0.002,
+        ),
     ),
     init_state=ArticulationCfg.InitialStateCfg(
         joint_pos={joint: 0.0 for joint in WHEEL_JOINTS},
+        joint_vel={joint: 0.0 for joint in WHEEL_JOINTS},
     ),
     actuators={
-        "wheel_acts": ImplicitActuatorCfg(
-            joint_names_expr=WHEEL_JOINTS,
-            effort_limit_sim=6.0,   # Max torque per joint (Nm)
-            stiffness=0.0,          # No spring force (acts as velocity control)
-            damping=30.0,           # Damping tuned for small tracked robot (~6kg)
+        "wheel_actuators": ImplicitActuatorCfg(
+            joint_names_expr=WHEEL_JOINTS,  # wheel joints to control
+            effort_limit_sim=5.0,           # max torque (Nm) per wheel
+            stiffness=0.0,                  # no spring force (pure torque mode)
+            damping=1.0,                    # resists motion (lower = faster)
+            friction=0.5,                   # contact friction (lower = faster)
+            armature=0.0005,                # small inertia for stability                    
         ),
     },
 )
