@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: BSD-3-Clause
-
+#
 # TEKO Environment — Modular Version (Torque-driven)
 # --------------------------------------------------
 # Modular structure:
@@ -24,6 +24,21 @@ from .curriculum.curriculum_manager import reset_environment_curriculum, set_cur
 from .utils.geometry_utils import yaw_to_quat
 from .utils.logging_utils import collect_episode_stats
 from .robots.teko_static import TEKOStatic  # ✅ Import static goal class
+
+
+# ------------------------------------------------------------------
+# Helper: obtain world position of a USD prim
+# ------------------------------------------------------------------
+def get_prim_world_pos(stage, prim_path: str, device: str) -> torch.Tensor:
+    """Return the world position of a USD prim as a (1, 3) torch tensor."""
+    from pxr import Usd
+    prim = stage.GetPrimAtPath(prim_path)
+    if not prim.IsValid():
+        raise RuntimeError(f"[ERROR] Prim not found: {prim_path}")
+    xf = UsdGeom.Xformable(prim)
+    mat = xf.ComputeLocalToWorldTransform(Usd.TimeCode.Default())  # ← Changed
+    trans = mat.ExtractTranslation()
+    return torch.tensor([[trans[0], trans[1], trans[2]]], device=device)
 
 
 class TekoEnv(DirectRLEnv):
@@ -57,9 +72,9 @@ class TekoEnv(DirectRLEnv):
         self.episode_lengths = []
         self.episode_successes = []
         self.reward_components = {
-            'distance': [], 'alignment': [], 'orientation': [],
-            'velocity_penalty': [], 'oscillation_penalty': [],
-            'collision_penalty': [], 'wall_penalty': []
+            "distance": [], "alignment": [], "orientation": [],
+            "velocity_penalty": [], "oscillation_penalty": [],
+            "collision_penalty": [], "wall_penalty": []
         }
 
         super().__init__(cfg, render_mode, **kwargs)
@@ -132,14 +147,14 @@ class TekoEnv(DirectRLEnv):
             if robot_prim.IsValid():
                 xf_robot = UsdGeom.Xformable(robot_prim)
                 xf_robot.ClearXformOpOrder()
-                xf_robot.AddTranslateOp().Set(Gf.Vec3d(-0.2, 0.0, 0.43))
+                xf_robot.AddTranslateOp().Set(Gf.Vec3d(-0.2, 0.0, 0.5))
                 xf_robot.AddRotateZOp().Set(180.0)
 
-            # --- Static goal robot using TEKOStatic ---
+            # Static goal robot
             try:
                 TEKOStatic(
                     prim_path=f"{env_path}/RobotGoal",
-                    aruco_path=ARUCO_IMG_PATH
+                    aruco_path=ARUCO_IMG_PATH,
                 )
                 print(f"[INFO] Spawned static TEKO goal (teko_goal.usd) in env_{env_idx}")
             except Exception as e:
@@ -235,21 +250,38 @@ class TekoEnv(DirectRLEnv):
     # Dones
     # ------------------------------------------------------------------
     def _get_dones(self):
-        robot_pos = self.robot.data.root_pos_w
-        goal_pos = self.goal_positions
-        distance = torch.norm(robot_pos - goal_pos, dim=-1)
-        target_distance = 0.43
-        success = (torch.abs(distance - target_distance) < 0.02)
-        collision = distance < 0.35
+        """Check for success, collision, and boundary termination using connector tips."""
+        stage = get_context().get_stage()
+
+        female_tip = get_prim_world_pos(
+            stage,
+            "/World/envs/env_0/Robot/teko_urdf/TEKO_Body/TEKO_ConnectorRear/SphereRear",
+            self.device,
+        )
+        male_tip = get_prim_world_pos(
+            stage,
+            "/World/envs/env_0/RobotGoal/teko_urdf/TEKO_Body/TEKO_ConnectorMale/TEKO_ConnectorPin/SpherePin",
+            self.device,
+        )
+
+        dock_distance = torch.norm(female_tip - male_tip, dim=-1)
+
+        success = dock_distance < 0.02   # within 2 cm
+        collision = dock_distance < 0.01 # overlap threshold
+
         half_size = self.arena_size / 2.0
+        robot_pos = self.robot.data.root_pos_w
         out_of_bounds = (
             (torch.abs(robot_pos[:, 0]) > half_size)
             | (torch.abs(robot_pos[:, 1]) > half_size)
         )
+
         terminated = (success | collision | out_of_bounds).squeeze(-1)
         time_out = torch.zeros_like(terminated)
+
         if success.any():
             self.episode_successes.append(True)
+
         return terminated, time_out
 
     # ------------------------------------------------------------------
@@ -262,6 +294,21 @@ class TekoEnv(DirectRLEnv):
         self.prev_distance = None
         self.prev_actions = None
         self.step_count.zero_()
+
+        # --- Lift active robot slightly to avoid wheel penetration ---
+        if hasattr(self.cfg, "robot_spawn_z_offset"):
+            # Get current root state tensor (pos, rot, vel, ang_vel)
+            root_state = self.robot.data.root_state_w.clone()
+
+            # Apply upward offset to Z position
+            root_state[:, 2] += self.cfg.robot_spawn_z_offset
+
+            # Write updated root state back to simulation
+            self.robot.write_root_state_to_sim(root_state)
+
+            # Allow physics to settle for a few frames
+            for _ in range(20):
+                self.step(torch.zeros((1, 2), device=self.device))
 
     def set_curriculum_level(self, level: int):
         set_curriculum_level(self, level)

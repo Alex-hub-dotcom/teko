@@ -5,7 +5,7 @@ TEKO Environment Configuration (Torque-driven, Modular)
 Compatible with Isaac Lab 0.47.1 / Isaac Sim 5.0.
 
 Provides configuration for:
-- Active torque-driven robot
+- Active torque-driven robot (spawn offset added to prevent floor clipping)
 - Static goal robot (with ArUco marker)
 - Camera setup
 - Scene, simulation, and observation/action specs
@@ -18,8 +18,7 @@ from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sim import SimulationCfg
 from isaaclab.utils import configclass
 
-# ✅ Import robot configuration (absolute path to avoid NoneType issue)
-from source.teko.teko.tasks.direct.teko.robots.teko import TEKO_CONFIGURATION
+from teko.tasks.direct.teko.robots.teko import TEKO_CONFIGURATION
 
 
 @configclass
@@ -52,7 +51,14 @@ class TekoEnvCfg(DirectRLEnvCfg):
     )
 
     # ------------------------------------------------------------------
-    # Active robot configuration (✅ must not be None)
+    # Spawn offset (active robot only)
+    # ------------------------------------------------------------------
+    # Prevents the robot’s wheels from spawning intersecting with the ground.
+    # The robot will spawn 3 cm above the ground and settle naturally with gravity.
+    robot_spawn_z_offset = 0.03
+
+    # ------------------------------------------------------------------
+    # Active robot configuration
     # ------------------------------------------------------------------
     robot_cfg: ArticulationCfg = TEKO_CONFIGURATION.replace(
         prim_path="/World/envs/env_.*/Robot"
@@ -70,7 +76,7 @@ class TekoEnvCfg(DirectRLEnvCfg):
     # Actuation parameters
     # ------------------------------------------------------------------
     action_scale = 1.0
-    max_wheel_torque = 5.0  # Nm per wheel  IT CHANGE THE FORCE, THUS THE VELOCITY
+    max_wheel_torque = 5.0  # Nm per wheel (controls speed/acceleration)
     wheel_polarity = [1.0, -1.0, 1.0, -1.0]  # Left/Right differential polarity
 
     # ------------------------------------------------------------------
