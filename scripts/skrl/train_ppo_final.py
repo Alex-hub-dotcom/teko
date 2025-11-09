@@ -211,8 +211,8 @@ def main():
     save_dir = f"/workspace/teko/runs/teko_ppo_{timestamp}"
     os.makedirs(save_dir, exist_ok=True)
 
-   #trainer = SequentialTrainer(cfg={"timesteps": 200_000, "headless": args.headless}, env=env, agents=agent)
-    trainer = SequentialTrainer(cfg={"timesteps": 5_000, "headless": args.headless}, env=env, agents=agent)
+    trainer = SequentialTrainer(cfg={"timesteps": 2_000_000, "headless": args.headless}, env=env, agents=agent)
+
     print(f"\n✓ Checkpoints will be saved to: {save_dir}")
     print("\n" + "=" * 80)
     print("🎓 Starting training...")

@@ -1,7 +1,0 @@
-Training Summary
-================
-Timestamp: 20251104_204033
-Num Envs: 16
-Total Timesteps: 200000
-Curriculum: True
-Final Level: 0
