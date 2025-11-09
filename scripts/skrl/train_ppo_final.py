@@ -1,33 +1,25 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: BSD-3-Clause
 """
-TEKO Vision-Based Docking — PPO Training (Final, No Env Edits)
---------------------------------------------------------------
-Runs PPO training with automatic environment patch to keep
-actions consistent (fixes oscillation_penalty crash).
+TEKO Vision-Based Docking — PPO Training (Final Fix)
+- Fixes tuple actions in _pre_physics_step
+- No edits to teko_env.py
 """
 
 import argparse
 from isaaclab.app import AppLauncher
 
-# -------------------------------------------------------
-# 1. Parse args and launch IsaacSim first
-# -------------------------------------------------------
 parser = argparse.ArgumentParser()
 parser.add_argument("--num_envs", type=int, default=4)
 parser.add_argument("--headless", action="store_true")
 args, _ = parser.parse_known_args()
 
 app_launcher = AppLauncher(args_cli=args)
-simulation_app = app_launcher.app  # PhysX, omni.* loaded here
+simulation_app = app_launcher.app
 
-# -------------------------------------------------------
-# 2. Imports (safe after app start)
-# -------------------------------------------------------
-import torch
-import torch.nn as nn
 import os
 from datetime import datetime
+import torch, torch.nn as nn, gymnasium as gym, numpy as np
 
 from skrl.utils import set_seed
 from skrl.memories.torch import RandomMemory
@@ -40,112 +32,143 @@ from teko.tasks.direct.teko.teko_env import TekoEnv, TekoEnvCfg
 from teko.tasks.direct.teko.teko_brain.cnn_model import create_visual_encoder
 
 
-# =========================================================================================
-# Observation Wrapper
-# =========================================================================================
-class RGBExtractorWrapper:
-    """Extracts plain RGB tensor (N, 3, H, W) from env observations."""
+# ======================================================================
+# Wrappers
+# ======================================================================
+class RGBBoxWrapper:
     def __init__(self, env):
         self.env = env
-        self.observation_space = env.observation_space
+        h, w = env.cfg.camera.height, env.cfg.camera.width
+        self.observation_space = gym.spaces.Box(0.0, 1.0, shape=(3, h, w), dtype=np.float32)
         self.action_space = env.action_space
+        self.num_envs = getattr(env.scene.cfg, "num_envs", 1)
 
-    def reset(self, *args, **kwargs):
-        obs, info = self.env.reset(*args, **kwargs)
+    def reset(self, *a, **kw):
+        obs, info = self.env.reset(*a, **kw)
         if isinstance(obs, dict):
             obs = obs.get("policy", obs.get("rgb", obs))
+        if isinstance(obs, torch.Tensor):
+            obs = obs.float()
         return obs, info
 
     def step(self, actions):
-        obs, reward, done, truncated, info = self.env.step(actions)
+        obs, r, t, tr, i = self.env.step(actions)
         if isinstance(obs, dict):
             obs = obs.get("policy", obs.get("rgb", obs))
-        return obs, reward, done, truncated, info
+        if isinstance(obs, torch.Tensor):
+            obs = obs.float()
+        return obs, r, t, tr, i
 
-    def __getattr__(self, name):
-        return getattr(self.env, name)
+    def __getattr__(self, n):
+        return getattr(self.env, n)
 
 
-# =========================================================================================
+class ActionBoxWrapper:
+    def __init__(self, env):
+        self.env = env
+        self.num_envs = getattr(env.scene.cfg, "num_envs", 1)
+        self.device = getattr(env, "device", torch.device("cuda:0" if torch.cuda.is_available() else "cpu"))
+        self.action_space = gym.spaces.Box(-1.0, 1.0, (2,), np.float32)
+        self.observation_space = env.observation_space
+
+    def reset(self, *a, **kw):
+        return self.env.reset(*a, **kw)
+
+    def step(self, actions):
+        if isinstance(actions, tuple):  # <-- FIX 1: unwrap IsaacLab tuple
+            actions = actions[0]
+
+        if isinstance(actions, np.ndarray):
+            actions = torch.from_numpy(actions)
+        if not isinstance(actions, torch.Tensor):
+            actions = torch.tensor(actions)
+        actions = actions.to(self.device, dtype=torch.float32)
+
+        if actions.ndim == 1:
+            actions = actions.unsqueeze(0).repeat(self.num_envs, 1)
+        return self.env.step(actions)
+
+    def __getattr__(self, n):
+        return getattr(self.env, n)
+
+
+# ======================================================================
 # PPO Models
-# =========================================================================================
-class PolicyNetwork(GaussianMixin, Model):
-    def __init__(self, observation_space, action_space, device, **kwargs):
-        Model.__init__(self, observation_space, action_space, device)
-        GaussianMixin.__init__(self, **kwargs)
-        self.encoder = create_visual_encoder("simple", feature_dim=256, pretrained=False)
-        self.policy_head = nn.Sequential(
-            nn.Linear(256, 128), nn.ReLU(),
-            nn.Linear(128, 64), nn.ReLU(),
-            nn.Linear(64, self.num_actions), nn.Tanh()
-        )
+# ======================================================================
+class PolicyNet(GaussianMixin, Model):
+    def __init__(self, obs, act, dev, **kw):
+        Model.__init__(self, obs, act, dev)
+        GaussianMixin.__init__(self, **kw)
+        self.encoder = create_visual_encoder("simple", 256, False)
+        self.head = nn.Sequential(nn.Linear(256, 128), nn.ReLU(),
+                                  nn.Linear(128, 64), nn.ReLU(),
+                                  nn.Linear(64, self.num_actions), nn.Tanh())
         self.log_std = nn.Parameter(torch.zeros(self.num_actions))
 
     def compute(self, inputs, role):
         x = inputs["states"]
         if x.ndim == 2 and x.shape[1] == 3 * 480 * 640:
-            B = x.shape[0]
-            x = x.view(B, 3, 480, 640)
-        feats = self.encoder(x)
-        mu = self.policy_head(feats)
-        return mu, self.log_std, {}
+            x = x.view(x.shape[0], 3, 480, 640)
+        return self.head(self.encoder(x)), self.log_std, {}
 
 
-class ValueNetwork(DeterministicMixin, Model):
-    def __init__(self, observation_space, action_space, device, **kwargs):
-        Model.__init__(self, observation_space, action_space, device)
-        DeterministicMixin.__init__(self, **kwargs)
-        self.encoder = create_visual_encoder("simple", feature_dim=256, pretrained=False)
-        self.value_head = nn.Sequential(
-            nn.Linear(256, 128), nn.ReLU(),
-            nn.Linear(128, 64), nn.ReLU(),
-            nn.Linear(64, 1)
-        )
+class ValueNet(DeterministicMixin, Model):
+    def __init__(self, obs, act, dev, **kw):
+        Model.__init__(self, obs, act, dev)
+        DeterministicMixin.__init__(self, **kw)
+        self.encoder = create_visual_encoder("simple", 256, False)
+        self.v = nn.Sequential(nn.Linear(256, 128), nn.ReLU(),
+                               nn.Linear(128, 64), nn.ReLU(),
+                               nn.Linear(64, 1))
 
     def compute(self, inputs, role):
         x = inputs["states"]
         if x.ndim == 2 and x.shape[1] == 3 * 480 * 640:
-            B = x.shape[0]
-            x = x.view(B, 3, 480, 640)
-        feats = self.encoder(x)
-        v = self.value_head(feats)
-        return v, {}
+            x = x.view(x.shape[0], 3, 480, 640)
+        return self.v(self.encoder(x)), {}
 
 
-# =========================================================================================
-# MAIN
-# =========================================================================================
+# ======================================================================
+# Main
+# ======================================================================
 def main():
     print("\n" + "=" * 80)
-    print("🚀 TEKO Vision-Based Docking - PPO Training (Final, No Env Edit)")
+    print("🚀 TEKO Vision-Based Docking - PPO Training (Final Fix)")
     print("=" * 80 + "\n")
 
     set_seed(42)
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-    # -----------------------------------------------------------------------------
-    # Environment
-    # -----------------------------------------------------------------------------
     cfg = TekoEnvCfg()
     cfg.scene.num_envs = args.num_envs
     base_env = TekoEnv(cfg=cfg)
-    env = RGBExtractorWrapper(base_env)
 
-    # ✅ Runtime hotfix to align actions for oscillation penalty
-    def safe_pre_physics_step(actions):
-        if getattr(env, "actions", None) is not None:
-            prev = getattr(env, "prev_actions", None)
-            if prev is None or prev.shape != actions.shape:
-                env.prev_actions = torch.zeros_like(actions)
-            else:
-                env.prev_actions = env.actions.clone()
-        env.actions = actions
-        env._lazy_init_articulation()
-    env._pre_physics_step = safe_pre_physics_step.__get__(env, type(env))
-    print("⚙️ Applied runtime patch: safe_pre_physics_step (no env edits)")
+    # --- FIX 2: robust tuple-safe prev_actions patch ---
+    def _safe_pre_physics_step(actions):
+        if isinstance(actions, tuple):
+            actions = actions[0]  # unwrap
+        
+        # Initialize prev_actions if needed
+        if not hasattr(base_env, 'prev_actions') or base_env.prev_actions is None:
+            base_env.prev_actions = torch.zeros_like(actions)
+        elif base_env.prev_actions.shape != actions.shape:
+            base_env.prev_actions = torch.zeros_like(actions)
+        else:
+            # Store current actions as prev_actions for next step
+            prev = base_env.actions if hasattr(base_env, 'actions') else actions
+            if isinstance(prev, tuple):
+                prev = prev[0]  # ADDED: unwrap tuple here too!
+            base_env.prev_actions.copy_(prev)
+        
+        base_env.actions = actions
+        base_env._lazy_init_articulation()
 
-    # Wrap for SKRL compatibility
-    env = wrap_env(env)
+    base_env._pre_physics_step = _safe_pre_physics_step
+    print("⚙️ Applied runtime patch: prev_actions alignment (tuple-safe)")
+
+    env = RGBBoxWrapper(base_env)
+    env = ActionBoxWrapper(env)
+    env = wrap_env(env, wrapper="gymnasium")
 
     print(f"[DEBUG] Observation space: {env.observation_space}")
     print(f"[DEBUG] Action space     : {env.action_space}")
@@ -153,11 +176,8 @@ def main():
     obs, _ = env.reset()
     print(f"[DEBUG] First obs type/shape: {type(obs)} {getattr(obs, 'shape', None)}")
 
-    # -----------------------------------------------------------------------------
-    # PPO Setup
-    # -----------------------------------------------------------------------------
-    policy = PolicyNetwork(env.observation_space, env.action_space, device)
-    value = ValueNetwork(env.observation_space, env.action_space, device)
+    policy = PolicyNet(env.observation_space, env.action_space, device)
+    value = ValueNet(env.observation_space, env.action_space, device)
     print(f"✓ Policy params: {sum(p.numel() for p in policy.parameters()):,}")
     print(f"✓ Value  params: {sum(p.numel() for p in value.parameters()):,}")
 
@@ -176,11 +196,7 @@ def main():
         "value_loss_scale": 0.5,
     })
 
-    memory = RandomMemory(
-        memory_size=ppo_cfg["rollouts"],
-        num_envs=args.num_envs,
-        device=device
-    )
+    memory = RandomMemory(memory_size=ppo_cfg["rollouts"], num_envs=args.num_envs, device=device)
 
     agent = PPO(
         models={"policy": policy, "value": value},
@@ -195,30 +211,17 @@ def main():
     save_dir = f"/workspace/teko/runs/teko_ppo_{timestamp}"
     os.makedirs(save_dir, exist_ok=True)
 
-    trainer_cfg = {
-        "timesteps": 200_000,
-        "headless": args.headless,
-        "disable_progressbar": False,
-        "close_environment_at_exit": True,
-    }
-    trainer = SequentialTrainer(cfg=trainer_cfg, env=env, agents=agent)
-
+   #trainer = SequentialTrainer(cfg={"timesteps": 200_000, "headless": args.headless}, env=env, agents=agent)
+    trainer = SequentialTrainer(cfg={"timesteps": 5_000, "headless": args.headless}, env=env, agents=agent)
     print(f"\n✓ Checkpoints will be saved to: {save_dir}")
     print("\n" + "=" * 80)
     print("🎓 Starting training...")
     print("=" * 80 + "\n")
 
-    # -----------------------------------------------------------------------------
-    # Training
-    # -----------------------------------------------------------------------------
     trainer.train()
 
-    # -----------------------------------------------------------------------------
-    # Save final model
-    # -----------------------------------------------------------------------------
-    final_path = os.path.join(save_dir, "final_model.pt")
-    agent.save(final_path)
-    print(f"\n✅ Training complete!\n💾 Model saved to: {final_path}\n")
+    agent.save(os.path.join(save_dir, "final_model.pt"))
+    print(f"\n✅ Training complete!\n💾 Model saved to: {save_dir}/final_model.pt\n")
 
     env.close()
     simulation_app.close()

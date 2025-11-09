@@ -76,7 +76,7 @@ class TekoEnvCfg(DirectRLEnvCfg):
     # Actuation parameters
     # ------------------------------------------------------------------
     action_scale = 1.0
-    max_wheel_torque = 5.0  # Nm per wheel (controls speed/acceleration)
+    max_wheel_torque = 2.0  # Nm per wheel (controls speed/acceleration)
     wheel_polarity = [1.0, -1.0, 1.0, -1.0]  # Left/Right differential polarity
 
     # ------------------------------------------------------------------

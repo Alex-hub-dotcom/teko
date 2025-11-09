@@ -42,14 +42,15 @@ TEKO_CONFIGURATION = ArticulationCfg(
         joint_pos={joint: 0.0 for joint in WHEEL_JOINTS},
         joint_vel={joint: 0.0 for joint in WHEEL_JOINTS},
     ),
-    actuators={
+   actuators={
         "wheel_actuators": ImplicitActuatorCfg(
-            joint_names_expr=WHEEL_JOINTS,  # wheel joints to control
-            effort_limit_sim=5.0,           # max torque (Nm) per wheel
-            stiffness=0.0,                  # no spring force (pure torque mode)
-            damping=1.0,                    # resists motion (lower = faster)
-            friction=0.5,                   # contact friction (lower = faster)
-            armature=0.0005,                # small inertia for stability                    
+            joint_names_expr=WHEEL_JOINTS,
+            effort_limit_sim=5.0,    # ← Back to 5.0 Nm
+            stiffness=0.0,
+            damping=1.0,             # ← Back to 1.0
+            friction=0.3,            # ← Reduce friction
+            armature=0.0005,
         ),
     },
+
 )
