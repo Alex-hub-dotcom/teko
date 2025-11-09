@@ -2,72 +2,92 @@
 #
 # Penalty functions for the TEKO environment.
 # -------------------------------------------
-# Fully Isaac Lab compatible (no pxr imports).
-# Uses robot and goal data directly for all safety penalties.
+# Multi-environment support.
 
 import torch
 
 
-# ------------------------------------------------------------------
-# Velocity penalty
-# ------------------------------------------------------------------
-def compute_velocity_penalty(env, distance_error):
-    """Penalize excessive torque near goal."""
-    if env.actions is None:
-        return torch.zeros(env.scene.cfg.num_envs, device=env.device)
-    action_magnitude = torch.norm(env.actions, dim=-1)
-    distance_factor = torch.clamp(distance_error / 0.2, 0.0, 1.0)
-    return action_magnitude * (1.0 - distance_factor) * 3.0
+def compute_time_penalty(env):
+    """Small penalty for each step to encourage faster completion."""
+    return torch.full((env.scene.cfg.num_envs,), 0.01, device=env.device)
 
 
-# ------------------------------------------------------------------
-# Oscillation penalty
-# ------------------------------------------------------------------
+def compute_velocity_penalty_when_close(env, surface_xy_distance):
+    """
+    Penalize high velocity when close to goal (encourages careful alignment).
+    
+    Args:
+        surface_xy_distance: (num_envs,) - planar distance for each environment
+    """
+    # Get linear velocity magnitude for all environments
+    velocity = torch.norm(env.robot.data.root_lin_vel_w, dim=-1)  # (num_envs,)
+    
+    # Only penalize when very close to goal (< 20cm)
+    close_threshold = 0.20
+    is_close = surface_xy_distance < close_threshold
+    
+    # Penalty scales with velocity when close
+    penalty = torch.where(
+        is_close,
+        velocity * 2.0,  # Higher velocity = higher penalty when close
+        torch.tensor(0.0, device=env.device)
+    )
+    
+    return penalty
+
+
 def compute_oscillation_penalty(env):
-    """Penalize frequent reversals of wheel direction."""
+    """
+    Penalize frequent reversals of wheel direction.
+    Detects when action signs flip between steps.
+    """
     if env.prev_actions is None or env.actions is None:
-        env.prev_actions = env.actions.clone() if env.actions is not None else None
+        if env.actions is not None:
+            env.prev_actions = env.actions.clone()
         return torch.zeros(env.scene.cfg.num_envs, device=env.device)
-
+    
+    # Check if action product is negative (sign reversal)
     action_product = env.actions * env.prev_actions
-    reversal = (action_product < -0.5).any(dim=-1).float()
-    penalty = reversal * 8.0
+    reversal = (action_product < -0.5).any(dim=-1).float()  # (num_envs,)
+    penalty = reversal * 5.0
+    
     env.prev_actions = env.actions.clone()
     return penalty
 
 
-# ------------------------------------------------------------------
-# Collision penalty
-# ------------------------------------------------------------------
-def compute_collision_penalty(env):
-    """Penalize if robot gets too close to the goal (connector overlap)."""
-    robot_pos = env.robot.data.root_pos_w
-    goal_pos = env.goal_positions
-    dock_distance = torch.norm(robot_pos - goal_pos, dim=-1)
-    collision = dock_distance < 0.35  # approximate physical contact
-
-    return torch.where(
-        collision,
-        torch.tensor(50.0, device=env.device),
-        torch.tensor(0.0, device=env.device),
+def compute_wall_collision_penalty(env):
+    """Large penalty for hitting arena walls with extended boundaries."""
+    robot_pos_global = env.robot.data.root_pos_w
+    env_origins = env.scene.env_origins
+    robot_pos_local = robot_pos_global - env_origins
+    
+    # Extended boundaries: ±4.0m x ±4.0m
+    out_of_bounds = (
+        (torch.abs(robot_pos_local[:, 0]) > 4.0) |
+        (torch.abs(robot_pos_local[:, 1]) > 4.0)
     )
-
-
-# ------------------------------------------------------------------
-# Wall penalty
-# ------------------------------------------------------------------
-def compute_wall_penalty(env):
-    """Penalize approaching arena boundaries."""
-    robot_pos = env.robot.data.root_pos_w
-    half = env.arena_size / 2.0
-    margin_x = half - torch.abs(robot_pos[:, 0])
-    margin_y = half - torch.abs(robot_pos[:, 1])
-    min_margin = torch.min(margin_x, margin_y)
-
-    wall_threshold = 0.20
+    
     penalty = torch.where(
-        min_margin < wall_threshold,
-        15.0 * (wall_threshold - min_margin),
-        torch.tensor(0.0, device=env.device),
+        out_of_bounds,
+        torch.tensor(5.0, device=env.device),
+        torch.tensor(0.0, device=env.device)
     )
+    
+    return penalty
+
+
+# Robot collision penalty is computed inline in reward function
+def compute_robot_collision_penalty(env, surface_xy_distance):
+    """Gentle penalty for colliding with static robot."""
+    collision_threshold = 0.05  # 5cm
+    success_threshold = 0.03    # 3cm
+    
+    collision = (surface_xy_distance < collision_threshold) & (surface_xy_distance >= success_threshold)
+    
+    penalty = torch.where(
+        collision,
+        torch.tensor(2.0, device=env.device),
+        torch.tensor(0.0, device=env.device)
+    )
+    
     return penalty

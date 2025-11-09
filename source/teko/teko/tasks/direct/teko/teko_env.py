@@ -1,12 +1,7 @@
 # SPDX-License-Identifier: BSD-3-Clause
 #
-# TEKO Environment — Modular Version (Torque-driven)
-# --------------------------------------------------
-# Modular structure:
-# - Rewards and penalties: rewards/reward_functions.py
-# - Curriculum: curriculum/curriculum_manager.py
-# - Geometry utils: utils/geometry_utils.py
-# - Logging: utils/logging_utils.py
+# TEKO Environment — Modular Version (Torque-driven, Multi-env)
+# -------------------------------------------------------------
 
 from __future__ import annotations
 import numpy as np
@@ -23,26 +18,11 @@ from .rewards.reward_functions import compute_total_reward
 from .curriculum.curriculum_manager import reset_environment_curriculum, set_curriculum_level
 from .utils.geometry_utils import yaw_to_quat
 from .utils.logging_utils import collect_episode_stats
-from .robots.teko_static import TEKOStatic  # ✅ Import static goal class
-
-
-# ------------------------------------------------------------------
-# Helper: obtain world position of a USD prim
-# ------------------------------------------------------------------
-def get_prim_world_pos(stage, prim_path: str, device: str) -> torch.Tensor:
-    """Return the world position of a USD prim as a (1, 3) torch tensor."""
-    from pxr import Usd
-    prim = stage.GetPrimAtPath(prim_path)
-    if not prim.IsValid():
-        raise RuntimeError(f"[ERROR] Prim not found: {prim_path}")
-    xf = UsdGeom.Xformable(prim)
-    mat = xf.ComputeLocalToWorldTransform(Usd.TimeCode.Default())  # ← Changed
-    trans = mat.ExtractTranslation()
-    return torch.tensor([[trans[0], trans[1], trans[2]]], device=device)
+from .robots.teko_static import TEKOStatic
 
 
 class TekoEnv(DirectRLEnv):
-    """Torque-driven TEKO environment (modular RL version)."""
+    """Torque-driven TEKO environment with multi-env support."""
 
     cfg: TekoEnvCfg
 
@@ -58,21 +38,18 @@ class TekoEnv(DirectRLEnv):
         # Curriculum learning
         self.curriculum_level = 0
 
-        # State tracking
+        # State tracking (for all envs)
         self.prev_robot_pos = None
         self.prev_distance = None
         self.prev_actions = None
-        self.step_count = torch.zeros(1, dtype=torch.int32)
-
-        # Arena boundaries
-        self.arena_size = 2.0
+        self.step_count = None
 
         # Episode statistics for logging
         self.episode_rewards = []
         self.episode_lengths = []
         self.episode_successes = []
         self.reward_components = {
-            "distance": [], "alignment": [], "orientation": [],
+            "distance": [], "alignment": [],
             "velocity_penalty": [], "oscillation_penalty": [],
             "collision_penalty": [], "wall_penalty": []
         }
@@ -100,7 +77,6 @@ class TekoEnv(DirectRLEnv):
         self._setup_cameras()
         self._cache_goal_transforms()
 
-    # ------------------------------------------------------------------
     def _init_observation_space(self):
         """Initialize observation space based on camera resolution."""
         import gymnasium as gym
@@ -110,7 +86,6 @@ class TekoEnv(DirectRLEnv):
         })
         print(f"[INFO] Observation space set to {frame_shape}")
 
-    # ------------------------------------------------------------------
     def _setup_global_lighting(self, stage):
         """Configure ambient and directional lighting."""
         if stage.GetPrimAtPath("/World/DomeLight"):
@@ -127,7 +102,6 @@ class TekoEnv(DirectRLEnv):
         UsdGeom.Xformable(sun).AddRotateYOp().Set(30.0)
         print("[INFO] Global lighting setup complete.")
 
-    # ------------------------------------------------------------------
     def _setup_per_environment_assets(self, stage):
         """Load arena, robot, and static goal for each environment."""
         num_envs = self.scene.cfg.num_envs
@@ -136,18 +110,20 @@ class TekoEnv(DirectRLEnv):
 
         for env_idx in range(num_envs):
             env_path = f"/World/envs/env_{env_idx}"
+            
+            # Arena
             try:
                 arena_prim = stage.DefinePrim(f"{env_path}/Arena", "Xform")
                 arena_prim.GetReferences().AddReference(ARENA_USD_PATH)
             except Exception as e:
                 print(f"[WARN] Arena failed for env_{env_idx}: {e}")
 
-            # Active robot (already articulated)
+            # Active robot (articulated)
             robot_prim = stage.GetPrimAtPath(f"{env_path}/Robot")
             if robot_prim.IsValid():
                 xf_robot = UsdGeom.Xformable(robot_prim)
                 xf_robot.ClearXformOpOrder()
-                xf_robot.AddTranslateOp().Set(Gf.Vec3d(-0.2, 0.0, 0.5))
+                xf_robot.AddTranslateOp().Set(Gf.Vec3d(-0.2, 0.0, 0.4))
                 xf_robot.AddRotateZOp().Set(180.0)
 
             # Static goal robot
@@ -156,13 +132,12 @@ class TekoEnv(DirectRLEnv):
                     prim_path=f"{env_path}/RobotGoal",
                     aruco_path=ARUCO_IMG_PATH,
                 )
-                print(f"[INFO] Spawned static TEKO goal (teko_goal.usd) in env_{env_idx}")
+                print(f"[INFO] Spawned static TEKO goal in env_{env_idx}")
             except Exception as e:
                 print(f"[WARN] Failed to create static TEKO goal in env_{env_idx}: {e}")
 
         print(f"[INFO] Created {num_envs} environments.")
 
-    # ------------------------------------------------------------------
     def _setup_cameras(self):
         """Attach Isaac Sim camera objects to each robot."""
         sim = SimulationContext.instance()
@@ -184,15 +159,70 @@ class TekoEnv(DirectRLEnv):
             self.cameras.append(camera)
         print(f"[INFO] Initialized {len(self.cameras)} cameras.")
 
-    # ------------------------------------------------------------------
     def _cache_goal_transforms(self):
-        """Precompute goal positions for faster reward and done checks."""
+        """Precompute goal positions for faster access."""
         num_envs = self.scene.cfg.num_envs
         self.goal_positions = torch.zeros((num_envs, 3), device=self.device)
         for env_idx, origin in enumerate(self.scene.env_origins):
             local_goal = torch.tensor([1.0, 0.0, 0.40], device=self.device)
             self.goal_positions[env_idx] = origin + local_goal
         print(f"[INFO] Cached {num_envs} goal positions.")
+
+    # ------------------------------------------------------------------
+    # Sphere position computation (PhysX-based)
+    # ------------------------------------------------------------------
+    def get_sphere_distances_from_physics(self):
+        """
+        Get sphere distances using PhysX body positions + fixed offsets.
+        Uses live robot physics state instead of USD hierarchy.
+        """
+        # Fixed sphere offsets from robot base (measured from CAD)
+        FEMALE_OFFSET = torch.tensor([-0.1725, -0.01186, 0.01202], device=self.device)
+        MALE_OFFSET = torch.tensor([0.16667, 0.00636, -0.04615], device=self.device)
+        
+        # Active robot position (updates with physics every step)
+        active_pos = self.robot.data.root_pos_w  # (num_envs, 3)
+        active_quat = self.robot.data.root_quat_w  # (num_envs, 4)
+        
+        # Convert quaternion to rotation matrix for active robot
+        def quat_to_rot_matrix(q):
+            """Convert batch of quaternions (N,4) to rotation matrices (N,3,3)."""
+            w, x, y, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
+            
+            R = torch.zeros((q.shape[0], 3, 3), device=q.device)
+            R[:, 0, 0] = 1 - 2*(y*y + z*z)
+            R[:, 0, 1] = 2*(x*y - w*z)
+            R[:, 0, 2] = 2*(x*z + w*y)
+            R[:, 1, 0] = 2*(x*y + w*z)
+            R[:, 1, 1] = 1 - 2*(x*x + z*z)
+            R[:, 1, 2] = 2*(y*z - w*x)
+            R[:, 2, 0] = 2*(x*z - w*y)
+            R[:, 2, 1] = 2*(y*z + w*x)
+            R[:, 2, 2] = 1 - 2*(x*x + y*y)
+            return R
+        
+        active_rot = quat_to_rot_matrix(active_quat)  # (num_envs, 3, 3)
+        
+        # Apply rotation to offset and add to position
+        female_offset_rotated = torch.bmm(active_rot, FEMALE_OFFSET.unsqueeze(-1).expand(active_pos.shape[0], 3, 1))
+        female_pos = active_pos + female_offset_rotated.squeeze(-1)
+        
+        # Static robot position (goal is stationary, no rotation needed - always facing same way)
+        static_pos = self.goal_positions  # (num_envs, 3)
+        male_pos = static_pos + MALE_OFFSET.unsqueeze(0).expand(static_pos.shape[0], 3)
+        
+        # Compute distances
+        diff = female_pos - male_pos
+        dist_3d = torch.norm(diff, dim=-1)  # (num_envs,)
+        dist_xy = torch.norm(diff[:, :2], dim=-1)  # (num_envs,)
+        
+        # Subtract sphere radii
+        R_FEMALE = 0.005
+        R_MALE = 0.005
+        surface_3d = torch.clamp(dist_3d - (R_FEMALE + R_MALE), min=0.0)
+        surface_xy = torch.clamp(dist_xy - (R_FEMALE + R_MALE), min=0.0)
+        
+        return female_pos, male_pos, surface_xy, surface_3d
 
     # ------------------------------------------------------------------
     # Actions (Torque control)
@@ -227,61 +257,65 @@ class TekoEnv(DirectRLEnv):
     # ------------------------------------------------------------------
     # Observations
     # ------------------------------------------------------------------
-    def _get_observations(self):
+    def _get_observations(self) -> dict:
+        """Get RGB camera observations from all environments."""
         import torch.nn.functional as F
         num_envs = self.scene.cfg.num_envs
         h, w = self._cam_res[1], self._cam_res[0]
         rgb_obs = torch.zeros((num_envs, 3, h, w), device=self.device)
+        
         for env_idx, cam in enumerate(self.cameras):
             rgba = cam.get_rgba()
             if isinstance(rgba, np.ndarray) and rgba.size > 0:
                 rgb = torch.from_numpy(rgba[..., :3]).to(self.device).float().permute(2, 0, 1) / 255.0
                 rgb = F.interpolate(rgb.unsqueeze(0), size=(h, w), mode="bilinear", align_corners=False).squeeze(0)
                 rgb_obs[env_idx] = rgb
-        return {"policy": {"rgb": rgb_obs}}
+        
+        return {"policy": rgb_obs}
 
     # ------------------------------------------------------------------
     # Rewards (modular)
     # ------------------------------------------------------------------
     def _get_rewards(self):
+        """Compute rewards using modular reward functions."""
         return compute_total_reward(self)
 
     # ------------------------------------------------------------------
     # Dones
     # ------------------------------------------------------------------
     def _get_dones(self):
-        """Check for success, collision, and boundary termination using connector tips."""
-        stage = get_context().get_stage()
-
-        female_tip = get_prim_world_pos(
-            stage,
-            "/World/envs/env_0/Robot/teko_urdf/TEKO_Body/TEKO_ConnectorRear/SphereRear",
-            self.device,
-        )
-        male_tip = get_prim_world_pos(
-            stage,
-            "/World/envs/env_0/RobotGoal/teko_urdf/TEKO_Body/TEKO_ConnectorMale/TEKO_ConnectorPin/SpherePin",
-            self.device,
-        )
-
-        dock_distance = torch.norm(female_tip - male_tip, dim=-1)
-
-        success = dock_distance < 0.02   # within 2 cm
-        collision = dock_distance < 0.01 # overlap threshold
-
-        half_size = self.arena_size / 2.0
-        robot_pos = self.robot.data.root_pos_w
+        """Check for termination using physics-based sphere distances."""
+        num_envs = self.scene.cfg.num_envs
+        
+        # Get sphere distances using PhysX positions
+        female_pos, male_pos, surface_xy, surface_3d = self.get_sphere_distances_from_physics()
+        
+        # Success: surface_xy < 3cm
+        success_threshold = 0.03
+        success = surface_xy < success_threshold
+        
+        # Out of bounds - use LOCAL coordinates
+        robot_pos_global = self.robot.data.root_pos_w
+        env_origins = self.scene.env_origins
+        robot_pos_local = robot_pos_global - env_origins
+        
+        # Extended arena boundaries: ±4.0m x ±4.0m
         out_of_bounds = (
-            (torch.abs(robot_pos[:, 0]) > half_size)
-            | (torch.abs(robot_pos[:, 1]) > half_size)
+            (torch.abs(robot_pos_local[:, 0]) > 4.0) |
+            (torch.abs(robot_pos_local[:, 1]) > 4.0)
         )
-
-        terminated = (success | collision | out_of_bounds).squeeze(-1)
+        
+        terminated = success | out_of_bounds
         time_out = torch.zeros_like(terminated)
-
+        
+        # Debug logging
+        if terminated.any():
+            print(f"[DEBUG] Success: {success.sum().item()}, Out of bounds: {out_of_bounds.sum().item()}")
+            print(f"[DEBUG] surface_xy distances: {surface_xy[terminated]}")
+        
         if success.any():
-            self.episode_successes.append(True)
-
+            self.episode_successes.append(success.sum().item())
+        
         return terminated, time_out
 
     # ------------------------------------------------------------------
@@ -290,31 +324,33 @@ class TekoEnv(DirectRLEnv):
     def _reset_idx(self, env_ids):
         super()._reset_idx(env_ids)
         self._lazy_init_articulation()
-        reset_environment_curriculum(self, env_ids)
-        self.prev_distance = None
-        self.prev_actions = None
-        self.step_count.zero_()
+        # reset_environment_curriculum(self, env_ids)  # COMMENTED OUT FOR TESTING
+        
+        # Reset state tracking
+        if self.prev_distance is None:
+            self.prev_distance = torch.zeros(self.scene.cfg.num_envs, device=self.device)
+        if self.prev_actions is None:
+            self.prev_actions = torch.zeros((self.scene.cfg.num_envs, 2), device=self.device)
+        if self.step_count is None:
+            self.step_count = torch.zeros(self.scene.cfg.num_envs, dtype=torch.int32, device=self.device)
+        
+        self.prev_distance[env_ids] = 0.0
+        self.prev_actions[env_ids] = 0.0
+        self.step_count[env_ids] = 0
 
-        # --- Lift active robot slightly to avoid wheel penetration ---
+        # Lift active robot slightly
         if hasattr(self.cfg, "robot_spawn_z_offset"):
-            # Get current root state tensor (pos, rot, vel, ang_vel)
             root_state = self.robot.data.root_state_w.clone()
-
-            # Apply upward offset to Z position
-            root_state[:, 2] += self.cfg.robot_spawn_z_offset
-
-            # Write updated root state back to simulation
-            self.robot.write_root_state_to_sim(root_state)
-
-            # Allow physics to settle for a few frames
-            for _ in range(20):
-                self.step(torch.zeros((1, 2), device=self.device))
+            root_state[env_ids, 2] += self.cfg.robot_spawn_z_offset
+            self.robot.write_root_state_to_sim(root_state, env_ids=env_ids)
 
     def set_curriculum_level(self, level: int):
+        """Set curriculum difficulty level."""
         set_curriculum_level(self, level)
 
     # ------------------------------------------------------------------
     # Logging utilities
     # ------------------------------------------------------------------
     def get_episode_statistics(self):
+        """Collect episode statistics for logging."""
         return collect_episode_stats(self)
