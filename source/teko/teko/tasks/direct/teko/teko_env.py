@@ -185,24 +185,49 @@ class TekoEnv(DirectRLEnv):
         active_quat = self.robot.data.root_quat_w  # (num_envs, 4)
         
         # Convert quaternion to rotation matrix for active robot
-        def quat_to_rot_matrix(q):
-            """Convert batch of quaternions (N,4) to rotation matrices (N,3,3)."""
-            w, x, y, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
+        # def quat_to_rot_matrix(q):
+        #     """Convert batch of quaternions (N,4) to rotation matrices (N,3,3)."""
+        #     w, x, y, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
             
+        #     R = torch.zeros((q.shape[0], 3, 3), device=q.device)
+        #     R[:, 0, 0] = 1 - 2*(y*y + z*z)
+        #     R[:, 0, 1] = 2*(x*y - w*z)
+        #     R[:, 0, 2] = 2*(x*z + w*y)
+        #     R[:, 1, 0] = 2*(x*y + w*z)
+        #     R[:, 1, 1] = 1 - 2*(x*x + z*z)
+        #     R[:, 1, 2] = 2*(y*z - w*x)
+        #     R[:, 2, 0] = 2*(x*z - w*y)
+        #     R[:, 2, 1] = 2*(y*z + w*x)
+        #     R[:, 2, 2] = 1 - 2*(x*x + y*y)
+        #     return R
+        
+      
+
+
+        # CHATGPT FIX ====================================-======================================================
+        def quat_to_rot_matrix(q):
+            """Convert batch of quaternions (N,4) in XYZW to rotation matrices (N,3,3)."""
+            # Isaac Lab quaternions are [x, y, z, w]
+            x, y, z, w = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
             R = torch.zeros((q.shape[0], 3, 3), device=q.device)
+
             R[:, 0, 0] = 1 - 2*(y*y + z*z)
-            R[:, 0, 1] = 2*(x*y - w*z)
-            R[:, 0, 2] = 2*(x*z + w*y)
-            R[:, 1, 0] = 2*(x*y + w*z)
+            R[:, 0, 1] = 2*(x*y - z*w)
+            R[:, 0, 2] = 2*(x*z + y*w)
+
+            R[:, 1, 0] = 2*(x*y + z*w)
             R[:, 1, 1] = 1 - 2*(x*x + z*z)
-            R[:, 1, 2] = 2*(y*z - w*x)
-            R[:, 2, 0] = 2*(x*z - w*y)
-            R[:, 2, 1] = 2*(y*z + w*x)
+            R[:, 1, 2] = 2*(y*z - x*w)
+
+            R[:, 2, 0] = 2*(x*z - y*w)
+            R[:, 2, 1] = 2*(y*z + x*w)
             R[:, 2, 2] = 1 - 2*(x*x + y*y)
             return R
-        
+        # CHATGPT FIX ====================================-=======================================================
+
+
         active_rot = quat_to_rot_matrix(active_quat)  # (num_envs, 3, 3)
-        
+
         # Apply rotation to offset and add to position
         female_offset_rotated = torch.bmm(active_rot, FEMALE_OFFSET.unsqueeze(-1).expand(active_pos.shape[0], 3, 1))
         female_pos = active_pos + female_offset_rotated.squeeze(-1)
@@ -276,47 +301,73 @@ class TekoEnv(DirectRLEnv):
     # ------------------------------------------------------------------
     # Rewards (modular)
     # ------------------------------------------------------------------
+    
+    
+    # CHATGPT FIX ====================================-======================================================
     def _get_rewards(self):
         """Compute rewards using modular reward functions."""
-        return compute_total_reward(self)
+        total_reward = compute_total_reward(self)
+
+        # Debug print every 200 steps
+        if self.step_count is not None and (self.step_count[0] % 200 == 0):
+            d = self.reward_components["distance"][-1] if self.reward_components["distance"] else 0
+            a = self.reward_components["alignment"][-1] if self.reward_components["alignment"] else 0
+            _, _, surface_xy, _ = self.get_sphere_distances_from_physics()
+            print(
+                f"[DEBUG] step={int(self.step_count[0])} | "
+                f"distR={d:.3f} | alignB={a:.3f} | mean surface_xy={surface_xy.mean():.3f} m"
+            )
+
+        return total_reward
+
+    # CHATGPT FIX ====================================-======================================================
+
 
     # ------------------------------------------------------------------
     # Dones
     # ------------------------------------------------------------------
+
+    # CHATGPT FIX ====================================-======================================================
+    def _post_physics_step(self):
+        # call parent if needed; if you have super()._post_physics_step(), keep it
+        if self.step_count is None:
+            self.step_count = torch.zeros(self.scene.cfg.num_envs, dtype=torch.int32, device=self.device)
+        self.step_count += 1
+
     def _get_dones(self):
-        """Check for termination using physics-based sphere distances."""
         num_envs = self.scene.cfg.num_envs
-        
-        # Get sphere distances using PhysX positions
+
         female_pos, male_pos, surface_xy, surface_3d = self.get_sphere_distances_from_physics()
-        
-        # Success: surface_xy < 3cm
+
         success_threshold = 0.03
         success = surface_xy < success_threshold
-        
-        # Out of bounds - use LOCAL coordinates
+
         robot_pos_global = self.robot.data.root_pos_w
         env_origins = self.scene.env_origins
         robot_pos_local = robot_pos_global - env_origins
-        
-        # Extended arena boundaries: ±4.0m x ±4.0m
+
         out_of_bounds = (
             (torch.abs(robot_pos_local[:, 0]) > 4.0) |
             (torch.abs(robot_pos_local[:, 1]) > 4.0)
         )
-        
+
+        # --- NEW: time limit (configure in cfg if you want)
+        max_steps = getattr(self.cfg, "max_episode_steps", 500)
+        time_out = self.step_count >= max_steps
+
         terminated = success | out_of_bounds
-        time_out = torch.zeros_like(terminated)
-        
-        # Debug logging
+
         if terminated.any():
-            print(f"[DEBUG] Success: {success.sum().item()}, Out of bounds: {out_of_bounds.sum().item()}")
-            print(f"[DEBUG] surface_xy distances: {surface_xy[terminated]}")
-        
+            print(f"[DEBUG] Success: {success.sum().item()}, OOB: {out_of_bounds.sum().item()}")
+            print(f"[DEBUG] surface_xy (terminated): {surface_xy[terminated]}")
+
         if success.any():
             self.episode_successes.append(success.sum().item())
-        
+
         return terminated, time_out
+
+    # CHATGPT FIX ====================================-======================================================
+
 
     # ------------------------------------------------------------------
     # Reset and curriculum
