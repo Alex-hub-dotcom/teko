@@ -29,7 +29,7 @@ class TekoEnvCfg(DirectRLEnvCfg):
     # General parameters
     # ------------------------------------------------------------------
     decimation = 2
-    episode_length_s = 30.0
+    episode_length_s = 15.0  # SHORTER: 15 seconds instead of 30
 
     # ------------------------------------------------------------------
     # Simulation setup
@@ -53,7 +53,7 @@ class TekoEnvCfg(DirectRLEnvCfg):
     # ------------------------------------------------------------------
     # Spawn offset (active robot only)
     # ------------------------------------------------------------------
-    # Prevents the robot’s wheels from spawning intersecting with the ground.
+    # Prevents the robot's wheels from spawning intersecting with the ground.
     # The robot will spawn 3 cm above the ground and settle naturally with gravity.
     robot_spawn_z_offset = 0.03
 
@@ -76,7 +76,7 @@ class TekoEnvCfg(DirectRLEnvCfg):
     # Actuation parameters
     # ------------------------------------------------------------------
     action_scale = 1.0
-    max_wheel_torque = 2.0  # Nm per wheel (controls speed/acceleration)
+    max_wheel_torque = 3.0  # INCREASED: 3.0 Nm for faster movement
     wheel_polarity = [1.0, 1.0, 1.0, 1.0]  # Left/Right differential polarity
 
     # ------------------------------------------------------------------
@@ -127,6 +127,6 @@ class TekoEnvCfg(DirectRLEnvCfg):
     # Notes
     # ------------------------------------------------------------------
     # Actions in [-1, 1] are scaled by max_wheel_torque:
-    #   [1.0, 1.0]  → +2.0 Nm forward
-    #   [-1.0, -1.0] → -2.0 Nm reverse
+    #   [1.0, 1.0]  → +3.0 Nm forward (faster than before)
+    #   [-1.0, -1.0] → -3.0 Nm reverse
     #   [1.0, -1.0] → rotate in place
