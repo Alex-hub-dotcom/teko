@@ -98,38 +98,35 @@ def add_camera_light(stage):
 # Ground-truth helpers
 # -----------------------------------------------------------------------------
 def get_sphere_world_positions(env):
-    """Get world positions by directly reading from USD stage."""
-    stage = env.scene.stage
-    from pxr import UsdGeom, Gf
+    """Get world positions using corrected physics offsets."""
+    # Use same corrected offsets as training
+    FEMALE_OFFSET = torch.tensor([-0.245, 0.0, -0.07], device=env.device)
+    MALE_OFFSET = torch.tensor([0.22667, -0.00144, -0.08815], device=env.device)
     
-    # Get sphere prims
-    female_prim = stage.GetPrimAtPath("/World/envs/env_0/Robot/teko_urdf/TEKO_Body/TEKO_ConnectorRear/SphereRear")
-    male_prim = stage.GetPrimAtPath("/World/envs/env_0/RobotGoal/teko_urdf/TEKO_Body/TEKO_ConnectorMale/TEKO_ConnectorPin/SpherePin")
+    # Active robot
+    active_pos = env.robot.data.root_pos_w[0]
+    active_quat = env.robot.data.root_quat_w[0]
     
-    # Walk up the hierarchy to accumulate transforms
-    def get_world_pos(prim):
-        """Get world position by walking up the prim hierarchy."""
-        world_matrix = Gf.Matrix4d(1.0)  # Identity
-        
-        current = prim
-        while current and current.GetPath() != "/":
-            xformable = UsdGeom.Xformable(current)
-            if xformable:
-                local_matrix = xformable.GetLocalTransformation()
-                world_matrix = local_matrix * world_matrix
-            current = current.GetParent()
-        
-        translation = world_matrix.ExtractTranslation()
-        return np.array([translation[0], translation[1], translation[2]], dtype=np.float64)
+    # Rotation matrix (same as training)
+    w, x, y, z = active_quat[0], active_quat[1], active_quat[2], active_quat[3]
+    R = torch.zeros((3, 3), device=env.device)
+    R[0, 0] = 1 - 2*(y*y + z*z)
+    R[0, 1] = 2*(x*y - w*z)
+    R[0, 2] = 2*(x*z + w*y)
+    R[1, 0] = 2*(x*y + w*z)
+    R[1, 1] = 1 - 2*(x*x + z*z)
+    R[1, 2] = 2*(y*z - w*x)
+    R[2, 0] = 2*(x*z - w*y)
+    R[2, 1] = 2*(y*z + w*x)
+    R[2, 2] = 1 - 2*(x*x + y*y)
     
-    female_world = get_world_pos(female_prim)
-    male_world = get_world_pos(male_prim)
+    female_tip = (active_pos + R @ FEMALE_OFFSET).cpu().numpy()
     
-    print(f"[DEBUG] Female world (USD): {female_world}")
-    print(f"[DEBUG] Male world (USD): {male_world}")
-    print(f"[DEBUG] Distance (USD): {np.linalg.norm(female_world - male_world):.4f} m")
+    # Static robot
+    goal_pos = env.goal_positions[0]
+    male_tip = (goal_pos + MALE_OFFSET).cpu().numpy()
     
-    return female_world, male_world
+    return female_tip, male_tip
 
 
 def save_ground_truth(env, dur, thr=0.03):
