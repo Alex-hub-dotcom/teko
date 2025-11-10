@@ -226,37 +226,37 @@ class TekoEnv(DirectRLEnv):
     # ------------------------------------------------------------------
     # Debug visualization
     # ------------------------------------------------------------------
-    def _debug_visualize_spheres(self):
-        """Add red/blue debug spheres to visualize connector positions."""
-        stage = get_context().get_stage()
+    # def _debug_visualize_spheres(self):
+    #     """Add red/blue debug spheres to visualize connector positions."""
+    #     stage = get_context().get_stage()
         
-        # Get actual sphere positions
-        female_pos, male_pos, _, _ = self.get_sphere_distances_from_physics()
+    #     # Get actual sphere positions
+    #     female_pos, male_pos, _, _ = self.get_sphere_distances_from_physics()
         
-        for env_idx in range(self.scene.cfg.num_envs):
-            # Female connector (red) - half size
-            female_debug_path = f"/World/envs/env_{env_idx}/DebugFemale"
-            if not stage.GetPrimAtPath(female_debug_path):
-                sphere_prim = UsdGeom.Sphere.Define(stage, female_debug_path)
-                sphere_prim.CreateRadiusAttr(0.01)  # 1cm radius (half of previous 2cm)
-                sphere_prim.CreateDisplayColorAttr([(1.0, 0.0, 0.0)])  # Red
+    #     for env_idx in range(self.scene.cfg.num_envs):
+    #         # Female connector (red) - half size
+    #         female_debug_path = f"/World/envs/env_{env_idx}/DebugFemale"
+    #         if not stage.GetPrimAtPath(female_debug_path):
+    #             sphere_prim = UsdGeom.Sphere.Define(stage, female_debug_path)
+    #             sphere_prim.CreateRadiusAttr(0.01)  # 1cm radius (half of previous 2cm)
+    #             sphere_prim.CreateDisplayColorAttr([(1.0, 0.0, 0.0)])  # Red
             
-            sphere_xform = UsdGeom.Xformable(stage.GetPrimAtPath(female_debug_path))
-            pos = female_pos[env_idx].cpu().numpy()
-            sphere_xform.ClearXformOpOrder()
-            sphere_xform.AddTranslateOp().Set(Gf.Vec3d(float(pos[0]), float(pos[1]), float(pos[2])))
+    #         sphere_xform = UsdGeom.Xformable(stage.GetPrimAtPath(female_debug_path))
+    #         pos = female_pos[env_idx].cpu().numpy()
+    #         sphere_xform.ClearXformOpOrder()
+    #         sphere_xform.AddTranslateOp().Set(Gf.Vec3d(float(pos[0]), float(pos[1]), float(pos[2])))
             
-            # Male connector (blue) - half size
-            male_debug_path = f"/World/envs/env_{env_idx}/DebugMale"
-            if not stage.GetPrimAtPath(male_debug_path):
-                sphere_prim = UsdGeom.Sphere.Define(stage, male_debug_path)
-                sphere_prim.CreateRadiusAttr(0.01)  # 1cm radius
-                sphere_prim.CreateDisplayColorAttr([(0.0, 0.0, 1.0)])  # Blue
+    #         # Male connector (blue) - half size
+    #         male_debug_path = f"/World/envs/env_{env_idx}/DebugMale"
+    #         if not stage.GetPrimAtPath(male_debug_path):
+    #             sphere_prim = UsdGeom.Sphere.Define(stage, male_debug_path)
+    #             sphere_prim.CreateRadiusAttr(0.01)  # 1cm radius
+    #             sphere_prim.CreateDisplayColorAttr([(0.0, 0.0, 1.0)])  # Blue
             
-            sphere_xform = UsdGeom.Xformable(stage.GetPrimAtPath(male_debug_path))
-            pos = male_pos[env_idx].cpu().numpy()
-            sphere_xform.ClearXformOpOrder()
-            sphere_xform.AddTranslateOp().Set(Gf.Vec3d(float(pos[0]), float(pos[1]), float(pos[2])))
+    #         sphere_xform = UsdGeom.Xformable(stage.GetPrimAtPath(male_debug_path))
+    #         pos = male_pos[env_idx].cpu().numpy()
+    #         sphere_xform.ClearXformOpOrder()
+    #         sphere_xform.AddTranslateOp().Set(Gf.Vec3d(float(pos[0]), float(pos[1]), float(pos[2])))
 
     # ------------------------------------------------------------------
     # Actions (Torque control)
@@ -289,7 +289,7 @@ class TekoEnv(DirectRLEnv):
         self.robot.set_joint_effort_target(torque_targets, env_ids=env_ids, joint_ids=self.dof_idx)
         
         # DEBUG: Visualize connector spheres every step
-        self._debug_visualize_spheres()
+        #self._debug_visualize_spheres()
 
     # ------------------------------------------------------------------
     # Observations
