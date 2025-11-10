@@ -8,7 +8,7 @@ import argparse
 from isaaclab.app import AppLauncher
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--num_envs", type=int, default=2)
+parser.add_argument("--num_envs", type=int, default=1)
 parser.add_argument("--headless", action="store_true")
 parser.add_argument("--timesteps", type=int, default=5000)
 args, _ = parser.parse_known_args()

@@ -45,7 +45,7 @@ class TekoEnvCfg(DirectRLEnvCfg):
     # Scene configuration
     # ------------------------------------------------------------------
     scene: InteractiveSceneCfg = InteractiveSceneCfg(
-        num_envs=2,
+        num_envs=1,
         env_spacing=6.0,
         replicate_physics=True,
     )
@@ -77,7 +77,7 @@ class TekoEnvCfg(DirectRLEnvCfg):
     # ------------------------------------------------------------------
     action_scale = 1.0
     max_wheel_torque = 2.0  # Nm per wheel (controls speed/acceleration)
-    wheel_polarity = [1.0, -1.0, 1.0, -1.0]  # Left/Right differential polarity
+    wheel_polarity = [1.0, 1.0, 1.0, 1.0]  # Left/Right differential polarity
 
     # ------------------------------------------------------------------
     # Camera configuration (rear RGB camera)

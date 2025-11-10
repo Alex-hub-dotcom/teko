@@ -176,58 +176,33 @@ class TekoEnv(DirectRLEnv):
         Get sphere distances using PhysX body positions + fixed offsets.
         Uses live robot physics state instead of USD hierarchy.
         """
-        # Fixed sphere offsets from robot base (measured from CAD)
-        FEMALE_OFFSET = torch.tensor([-0.1725, -0.01186, 0.01202], device=self.device)
-        MALE_OFFSET = torch.tensor([0.16667, 0.00636, -0.04615], device=self.device)
+        # Fixed sphere offsets from robot base (calibrated manually)
+        FEMALE_OFFSET = torch.tensor([-0.245, 0.0, -0.07], device=self.device)
+        MALE_OFFSET = torch.tensor([0.22667, -0.00144, -0.08815], device=self.device)
         
         # Active robot position (updates with physics every step)
         active_pos = self.robot.data.root_pos_w  # (num_envs, 3)
         active_quat = self.robot.data.root_quat_w  # (num_envs, 4)
         
         # Convert quaternion to rotation matrix for active robot
-        # def quat_to_rot_matrix(q):
-        #     """Convert batch of quaternions (N,4) to rotation matrices (N,3,3)."""
-        #     w, x, y, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
-            
-        #     R = torch.zeros((q.shape[0], 3, 3), device=q.device)
-        #     R[:, 0, 0] = 1 - 2*(y*y + z*z)
-        #     R[:, 0, 1] = 2*(x*y - w*z)
-        #     R[:, 0, 2] = 2*(x*z + w*y)
-        #     R[:, 1, 0] = 2*(x*y + w*z)
-        #     R[:, 1, 1] = 1 - 2*(x*x + z*z)
-        #     R[:, 1, 2] = 2*(y*z - w*x)
-        #     R[:, 2, 0] = 2*(x*z - w*y)
-        #     R[:, 2, 1] = 2*(y*z + w*x)
-        #     R[:, 2, 2] = 1 - 2*(x*x + y*y)
-        #     return R
-        
-      
-
-
-        # CHATGPT FIX ====================================-======================================================
         def quat_to_rot_matrix(q):
-            """Convert batch of quaternions (N,4) in XYZW to rotation matrices (N,3,3)."""
-            # Isaac Lab quaternions are [x, y, z, w]
-            x, y, z, w = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
+            """Convert batch of quaternions (N,4) to rotation matrices (N,3,3)."""
+            w, x, y, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
+            
             R = torch.zeros((q.shape[0], 3, 3), device=q.device)
-
             R[:, 0, 0] = 1 - 2*(y*y + z*z)
-            R[:, 0, 1] = 2*(x*y - z*w)
-            R[:, 0, 2] = 2*(x*z + y*w)
-
-            R[:, 1, 0] = 2*(x*y + z*w)
+            R[:, 0, 1] = 2*(x*y - w*z)
+            R[:, 0, 2] = 2*(x*z + w*y)
+            R[:, 1, 0] = 2*(x*y + w*z)
             R[:, 1, 1] = 1 - 2*(x*x + z*z)
-            R[:, 1, 2] = 2*(y*z - x*w)
-
-            R[:, 2, 0] = 2*(x*z - y*w)
-            R[:, 2, 1] = 2*(y*z + x*w)
+            R[:, 1, 2] = 2*(y*z - w*x)
+            R[:, 2, 0] = 2*(x*z - w*y)
+            R[:, 2, 1] = 2*(y*z + w*x)
             R[:, 2, 2] = 1 - 2*(x*x + y*y)
             return R
-        # CHATGPT FIX ====================================-=======================================================
-
-
+        
         active_rot = quat_to_rot_matrix(active_quat)  # (num_envs, 3, 3)
-
+        
         # Apply rotation to offset and add to position
         female_offset_rotated = torch.bmm(active_rot, FEMALE_OFFSET.unsqueeze(-1).expand(active_pos.shape[0], 3, 1))
         female_pos = active_pos + female_offset_rotated.squeeze(-1)
@@ -248,6 +223,40 @@ class TekoEnv(DirectRLEnv):
         surface_xy = torch.clamp(dist_xy - (R_FEMALE + R_MALE), min=0.0)
         
         return female_pos, male_pos, surface_xy, surface_3d
+    # ------------------------------------------------------------------
+    # Debug visualization
+    # ------------------------------------------------------------------
+    def _debug_visualize_spheres(self):
+        """Add red/blue debug spheres to visualize connector positions."""
+        stage = get_context().get_stage()
+        
+        # Get actual sphere positions
+        female_pos, male_pos, _, _ = self.get_sphere_distances_from_physics()
+        
+        for env_idx in range(self.scene.cfg.num_envs):
+            # Female connector (red) - half size
+            female_debug_path = f"/World/envs/env_{env_idx}/DebugFemale"
+            if not stage.GetPrimAtPath(female_debug_path):
+                sphere_prim = UsdGeom.Sphere.Define(stage, female_debug_path)
+                sphere_prim.CreateRadiusAttr(0.01)  # 1cm radius (half of previous 2cm)
+                sphere_prim.CreateDisplayColorAttr([(1.0, 0.0, 0.0)])  # Red
+            
+            sphere_xform = UsdGeom.Xformable(stage.GetPrimAtPath(female_debug_path))
+            pos = female_pos[env_idx].cpu().numpy()
+            sphere_xform.ClearXformOpOrder()
+            sphere_xform.AddTranslateOp().Set(Gf.Vec3d(float(pos[0]), float(pos[1]), float(pos[2])))
+            
+            # Male connector (blue) - half size
+            male_debug_path = f"/World/envs/env_{env_idx}/DebugMale"
+            if not stage.GetPrimAtPath(male_debug_path):
+                sphere_prim = UsdGeom.Sphere.Define(stage, male_debug_path)
+                sphere_prim.CreateRadiusAttr(0.01)  # 1cm radius
+                sphere_prim.CreateDisplayColorAttr([(0.0, 0.0, 1.0)])  # Blue
+            
+            sphere_xform = UsdGeom.Xformable(stage.GetPrimAtPath(male_debug_path))
+            pos = male_pos[env_idx].cpu().numpy()
+            sphere_xform.ClearXformOpOrder()
+            sphere_xform.AddTranslateOp().Set(Gf.Vec3d(float(pos[0]), float(pos[1]), float(pos[2])))
 
     # ------------------------------------------------------------------
     # Actions (Torque control)
@@ -278,6 +287,9 @@ class TekoEnv(DirectRLEnv):
         torque_targets = torque_targets * polarity
         env_ids = torch.arange(num_envs, device=self.device)
         self.robot.set_joint_effort_target(torque_targets, env_ids=env_ids, joint_ids=self.dof_idx)
+        
+        # DEBUG: Visualize connector spheres every step
+        self._debug_visualize_spheres()
 
     # ------------------------------------------------------------------
     # Observations
@@ -301,73 +313,42 @@ class TekoEnv(DirectRLEnv):
     # ------------------------------------------------------------------
     # Rewards (modular)
     # ------------------------------------------------------------------
-    
-    
-    # CHATGPT FIX ====================================-======================================================
     def _get_rewards(self):
         """Compute rewards using modular reward functions."""
-        total_reward = compute_total_reward(self)
-
-        # Debug print every 200 steps
-        if self.step_count is not None and (self.step_count[0] % 200 == 0):
-            d = self.reward_components["distance"][-1] if self.reward_components["distance"] else 0
-            a = self.reward_components["alignment"][-1] if self.reward_components["alignment"] else 0
-            _, _, surface_xy, _ = self.get_sphere_distances_from_physics()
-            print(
-                f"[DEBUG] step={int(self.step_count[0])} | "
-                f"distR={d:.3f} | alignB={a:.3f} | mean surface_xy={surface_xy.mean():.3f} m"
-            )
-
-        return total_reward
-
-    # CHATGPT FIX ====================================-======================================================
-
+        return compute_total_reward(self)
 
     # ------------------------------------------------------------------
     # Dones
     # ------------------------------------------------------------------
-
-    # CHATGPT FIX ====================================-======================================================
-    def _post_physics_step(self):
-        # call parent if needed; if you have super()._post_physics_step(), keep it
-        if self.step_count is None:
-            self.step_count = torch.zeros(self.scene.cfg.num_envs, dtype=torch.int32, device=self.device)
-        self.step_count += 1
-
     def _get_dones(self):
+        """Check for termination using physics-based sphere distances."""
         num_envs = self.scene.cfg.num_envs
-
+        
+        # Get sphere distances using PhysX positions
         female_pos, male_pos, surface_xy, surface_3d = self.get_sphere_distances_from_physics()
-
+        
+        # Success: surface_xy < 3cm
         success_threshold = 0.03
         success = surface_xy < success_threshold
-
+        
+        # Out of bounds - use LOCAL coordinates
         robot_pos_global = self.robot.data.root_pos_w
         env_origins = self.scene.env_origins
         robot_pos_local = robot_pos_global - env_origins
-
+        
+        # Extended arena boundaries: ±4.0m x ±4.0m
         out_of_bounds = (
             (torch.abs(robot_pos_local[:, 0]) > 4.0) |
             (torch.abs(robot_pos_local[:, 1]) > 4.0)
         )
-
-        # --- NEW: time limit (configure in cfg if you want)
-        max_steps = getattr(self.cfg, "max_episode_steps", 500)
-        time_out = self.step_count >= max_steps
-
+        
         terminated = success | out_of_bounds
-
-        if terminated.any():
-            print(f"[DEBUG] Success: {success.sum().item()}, OOB: {out_of_bounds.sum().item()}")
-            print(f"[DEBUG] surface_xy (terminated): {surface_xy[terminated]}")
-
+        time_out = torch.zeros_like(terminated)
+        
         if success.any():
             self.episode_successes.append(success.sum().item())
-
+        
         return terminated, time_out
-
-    # CHATGPT FIX ====================================-======================================================
-
 
     # ------------------------------------------------------------------
     # Reset and curriculum
