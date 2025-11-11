@@ -164,42 +164,30 @@ class TekoEnv(DirectRLEnv):
     # Sphere position computation
     # ------------------------------------------------------------------
     def get_sphere_distances_from_physics(self):
-        FEMALE_OFFSET = torch.tensor([-0.245, 0.0, -0.07], device=self.device)
+        """Get sphere distances using fixed world-space offsets (no rotation needed)."""
+        # Calibrated offsets in world space
+        FEMALE_OFFSET = torch.tensor([0.24, 0.0, -0.08], device=self.device)
         MALE_OFFSET = torch.tensor([0.22667, -0.00144, -0.08815], device=self.device)
 
-        active_pos = self.robot.data.root_pos_w
-        active_quat = self.robot.data.root_quat_w
-
-        def quat_to_rot_matrix(q):
-            w, x, y, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
-            R = torch.zeros((q.shape[0], 3, 3), device=q.device)
-            R[:, 0, 0] = 1 - 2*(y*y + z*z)
-            R[:, 0, 1] = 2*(x*y - w*z)
-            R[:, 0, 2] = 2*(x*z + w*y)
-            R[:, 1, 0] = 2*(x*y + w*z)
-            R[:, 1, 1] = 1 - 2*(x*x + z*z)
-            R[:, 1, 2] = 2*(y*z - w*x)
-            R[:, 2, 0] = 2*(x*z - w*y)
-            R[:, 2, 1] = 2*(y*z + w*x)
-            R[:, 2, 2] = 1 - 2*(x*x + y*y)
-            return R
-
-        active_rot = quat_to_rot_matrix(active_quat)
-        female_offset_rotated = torch.bmm(active_rot, FEMALE_OFFSET.unsqueeze(-1).expand(active_pos.shape[0], 3, 1))
-        female_pos = active_pos + female_offset_rotated.squeeze(-1)
-
-        static_pos = self.goal_positions
+        # Robot positions
+        active_pos = self.robot.data.root_pos_w  # (num_envs, 3)
+        static_pos = self.goal_positions  # (num_envs, 3)
+        
+        # Apply offsets directly (no rotation - both robots face same direction)
+        female_pos = active_pos + FEMALE_OFFSET.unsqueeze(0).expand(active_pos.shape[0], 3)
         male_pos = static_pos + MALE_OFFSET.unsqueeze(0).expand(static_pos.shape[0], 3)
-
+        
+        # Compute distances
         diff = female_pos - male_pos
-        dist_3d = torch.norm(diff, dim=-1)
-        dist_xy = torch.norm(diff[:, :2], dim=-1)
-
+        dist_3d = torch.norm(diff, dim=-1)  # (num_envs,)
+        dist_xy = torch.norm(diff[:, :2], dim=-1)  # (num_envs,)
+        
+        # Subtract sphere radii
         R_FEMALE = 0.005
         R_MALE = 0.005
         surface_3d = torch.clamp(dist_3d - (R_FEMALE + R_MALE), min=0.0)
         surface_xy = torch.clamp(dist_xy - (R_FEMALE + R_MALE), min=0.0)
-
+        
         return female_pos, male_pos, surface_xy, surface_3d
 
     # ------------------------------------------------------------------
@@ -290,25 +278,24 @@ class TekoEnv(DirectRLEnv):
     def _reset_idx(self, env_ids):
         super()._reset_idx(env_ids)
         self._lazy_init_articulation()
-
+        
+        # Reset state tracking
         if self.prev_distance is None:
             self.prev_distance = torch.zeros(self.scene.cfg.num_envs, device=self.device)
         if self.prev_actions is None:
             self.prev_actions = torch.zeros((self.scene.cfg.num_envs, 2), device=self.device)
         if self.step_count is None:
             self.step_count = torch.zeros(self.scene.cfg.num_envs, dtype=torch.int32, device=self.device)
-
-        # Initialize previous distance to current to avoid reward spikes
-        _, _, surface_xy, _ = self.get_sphere_distances_from_physics()
-        self.prev_distance[env_ids] = surface_xy[env_ids]
+        
+        self.prev_distance[env_ids] = 0.0
         self.prev_actions[env_ids] = 0.0
         self.step_count[env_ids] = 0
 
-        if hasattr(self.cfg, "robot_spawn_z_offset"):
+        # Lift active robot slightly - FIX: Only if robot_spawn_z_offset is configured
+        if hasattr(self.cfg, "robot_spawn_z_offset") and self.cfg.robot_spawn_z_offset > 0:
             root_state = self.robot.data.root_state_w.clone()
             root_state[env_ids, 2] += self.cfg.robot_spawn_z_offset
             self.robot.write_root_state_to_sim(root_state, env_ids=env_ids)
-
     def set_curriculum_level(self, level: int):
         set_curriculum_level(self, level)
 

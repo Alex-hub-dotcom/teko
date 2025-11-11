@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: BSD-3-Clause
 #
-# Reward functions for the TEKO environment (v3.1)
+# Reward functions for the TEKO environment (v3.2 FINAL)
 # ================================================
 
 import torch
@@ -17,11 +17,11 @@ from teko.tasks.direct.teko.penalties.penalties import (
 def compute_total_reward(env) -> torch.Tensor:
     female_pos, male_pos, surface_xy, surface_3d = env.get_sphere_distances_from_physics()
 
-    # Debug counter (scalar) — safe
+    # Debug counter (scalar)
     dbg = getattr(env, "_dbg_counter", 0)
     if dbg % 50 == 0:
         try:
-            print(f"[REWARD DEBUG] surface_xy={float(surface_xy[0].item()) :.4f}")
+            print(f"[REWARD DEBUG] surface_xy={float(surface_xy[0].item()):.4f}")
         except Exception:
             pass
     setattr(env, "_dbg_counter", dbg + 1)
@@ -39,20 +39,22 @@ def compute_total_reward(env) -> torch.Tensor:
         progress_reward = torch.clamp(delta * 40.0, min=-5.0, max=5.0)
         env.prev_distance = surface_xy.clone()
 
-    # 3) Alignment
+    # 3) Alignment bonus
     alignment_bonus = compute_alignment_bonus(env, surface_xy)
 
-    # 4) Success
-    success_threshold = 0.03
-    success_bonus = torch.where(surface_xy < success_threshold,
-                                torch.tensor(100.0, device=env.device),
-                                torch.tensor(0.0, device=env.device))
+    # 4) Success bonus
+    success_threshold = 0.03  # 3 cm
+    success_bonus = torch.where(
+        surface_xy < success_threshold,
+        torch.tensor(100.0, device=env.device),
+        torch.tensor(0.0, device=env.device)
+    )
 
-    # 5) Penalties (each already NaN-safe)
-    time_penalty          = compute_time_penalty(env)
-    velocity_penalty      = compute_velocity_penalty_when_close(env, surface_xy)
-    oscillation_penalty   = compute_oscillation_penalty(env)
-    wall_penalty          = compute_wall_collision_penalty(env)
+    # 5) Penalties
+    time_penalty = compute_time_penalty(env)
+    velocity_penalty = compute_velocity_penalty_when_close(env, surface_xy)
+    oscillation_penalty = compute_oscillation_penalty(env)
+    wall_penalty = compute_wall_collision_penalty(env)
     robot_collision_penalty = compute_robot_collision_penalty(env, surface_xy)
 
     # 6) Combine
@@ -83,3 +85,29 @@ def compute_total_reward(env) -> torch.Tensor:
     env.reward_components["collision_penalty"].append(_m(robot_collision_penalty))
 
     return total_reward
+
+
+# ------------------------------------------------------------
+# Alignment Bonus
+# ------------------------------------------------------------
+def compute_alignment_bonus(env, surface_xy):
+    """Small bonus when close (<30 cm) and yaw error < 15°."""
+    robot_quat = env.robot.data.root_quat_w
+
+    # Extract yaw from quaternion
+    robot_yaw = torch.atan2(
+        2.0 * (robot_quat[:, 0] * robot_quat[:, 3] + robot_quat[:, 1] * robot_quat[:, 2]),
+        1.0 - 2.0 * (robot_quat[:, 2] ** 2 + robot_quat[:, 3] ** 2)
+    )
+
+    # Target yaw (facing the docking goal)
+    target_yaw = torch.tensor(np.pi, device=env.device)
+    yaw_error = torch.abs(robot_yaw - target_yaw)
+    yaw_error = torch.min(yaw_error, 2 * np.pi - yaw_error)
+
+    # Bonus if both close and well-aligned
+    is_close = surface_xy < 0.30
+    is_aligned = yaw_error < (15.0 * np.pi / 180.0)
+    return torch.where(is_close & is_aligned,
+                       torch.tensor(5.0, device=env.device),
+                       torch.tensor(0.0, device=env.device))

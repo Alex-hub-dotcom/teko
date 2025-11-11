@@ -31,11 +31,6 @@ DOT_RADIUS = 0.005  # 5 mm
 DOT_COLOR_FEMALE = (1.0, 0.0, 0.0)  # red
 DOT_COLOR_MALE   = (0.0, 0.0, 1.0)  # blue
 
-# Optional small correction vectors (meters)
-# Adjust these ONLY for visualization, not final physics alignment
-FEMALE_DELTA = (0.07, -0.0128, -0.095)
-MALE_DELTA   = (0.06, -0.0078, -0.042)
-
 # ---------------------------------------------------------------------
 # Initialize environment
 # ---------------------------------------------------------------------
@@ -46,13 +41,9 @@ sim = SimulationContext.instance()
 sim.step()  # settle physics
 
 # ---------------------------------------------------------------------
-# Get connector positions (from physics)
+# Get connector positions (from physics) - NO DELTAS
 # ---------------------------------------------------------------------
 female_pos, male_pos, surface_xy, surface_3d = env.get_sphere_distances_from_physics()
-
-# Apply optional visual deltas
-female_pos[0] += torch.tensor(FEMALE_DELTA, device=female_pos.device)
-male_pos[0]   += torch.tensor(MALE_DELTA,   device=male_pos.device)
 
 print(f"[DEBUG] female_pos[0]: {female_pos[0]}")
 print(f"[DEBUG] male_pos[0]:   {male_pos[0]}")
@@ -104,7 +95,6 @@ create_colored_sphere("MaleSphere",   male_pos[0].tolist(),   DOT_COLOR_MALE)
 
 print("[INFO] ✅ Red (female) and blue (male) spheres created.")
 print("👉 Press PLAY in Isaac Sim to view them.")
-print("   You can adjust FEMALE_DELTA or MALE_DELTA at the top if needed for fine-tuning.")
 
 # ---------------------------------------------------------------------
 # Keep simulation running
