@@ -11,7 +11,7 @@ from pxr import Sdf, UsdGeom, UsdLux, Gf
 from isaaclab.assets import Articulation
 from isaaclab.envs import DirectRLEnv
 from isaaclab.sim import SimulationContext
-from isaacsim.sensors.camera import Camera
+from isaaclab.sensors import Camera, CameraCfg  # FIXED IMPORT
 
 from .teko_env_cfg import TekoEnvCfg
 from .rewards.reward_functions import compute_total_reward
@@ -133,23 +133,27 @@ class TekoEnv(DirectRLEnv):
         print(f"[INFO] Created {num_envs} environments.")
 
     def _setup_cameras(self):
-        sim = SimulationContext.instance()
+        """Setup cameras using Isaac Lab's Camera sensor."""
         for env_idx in range(self.scene.cfg.num_envs):
             cam_path = (
                 f"/World/envs/env_{env_idx}/Robot/teko_urdf/TEKO_Body/"
                 "TEKO_WallBack/TEKO_Camera/RearCamera"
             )
-            cam_prim = sim.stage.GetPrimAtPath(cam_path)
-            if not cam_prim.IsValid():
-                print(f"[WARN] Camera not found at {cam_path}")
-                continue
-            camera = Camera(
+            
+            # Create camera config
+            cam_cfg = CameraCfg(
                 prim_path=cam_path,
-                resolution=self._cam_res,
-                frequency=self.cfg.camera.frequency_hz,
+                update_period=0,  # Update every step
+                height=self._cam_res[1],
+                width=self._cam_res[0],
+                data_types=["rgb"],
+                spawn=None,  # Camera already exists in USD
             )
-            camera.initialize()
+            
+            # Create camera sensor
+            camera = Camera(cfg=cam_cfg)
             self.cameras.append(camera)
+        
         print(f"[INFO] Initialized {len(self.cameras)} cameras.")
 
     def _cache_goal_transforms(self):
@@ -223,16 +227,35 @@ class TekoEnv(DirectRLEnv):
     # Observations
     # ------------------------------------------------------------------
     def _get_observations(self) -> dict:
+        """Get RGB observations from cameras."""
         import torch.nn.functional as F
         num_envs = self.scene.cfg.num_envs
         h, w = self._cam_res[1], self._cam_res[0]
         rgb_obs = torch.zeros((num_envs, 3, h, w), device=self.device)
 
         for env_idx, cam in enumerate(self.cameras):
-            rgba = cam.get_rgba()
-            if isinstance(rgba, np.ndarray) and rgba.size > 0:
-                rgb = torch.from_numpy(rgba[..., :3]).to(self.device).float().permute(2, 0, 1) / 255.0
-                rgb = F.interpolate(rgb.unsqueeze(0), size=(h, w), mode="bilinear", align_corners=False).squeeze(0)
+            # Update camera data
+            cam.update(dt=0.0)
+            
+            # Get RGB data
+            rgb_data = cam.data.output["rgb"]
+            if rgb_data is not None and rgb_data.numel() > 0:
+                # rgb_data shape: (1, H, W, 4) or (1, H, W, 3)
+                # Remove batch dimension if present
+                if rgb_data.ndim == 4:
+                    rgb_data = rgb_data.squeeze(0)  # Now (H, W, C)
+                
+                # Remove alpha channel if present
+                if rgb_data.shape[-1] == 4:
+                    rgb_data = rgb_data[..., :3]  # Now (H, W, 3)
+                
+                # Convert to (3, H, W) and normalize
+                rgb = rgb_data.permute(2, 0, 1).float() / 255.0
+                
+                # Resize if needed
+                if rgb.shape[1] != h or rgb.shape[2] != w:
+                    rgb = F.interpolate(rgb.unsqueeze(0), size=(h, w), mode="bilinear", align_corners=False).squeeze(0)
+                
                 rgb_obs[env_idx] = rgb
 
         return {"policy": rgb_obs}
@@ -291,11 +314,6 @@ class TekoEnv(DirectRLEnv):
         self.prev_actions[env_ids] = 0.0
         self.step_count[env_ids] = 0
 
-        # Lift active robot slightly - FIX: Only if robot_spawn_z_offset is configured
-        if hasattr(self.cfg, "robot_spawn_z_offset") and self.cfg.robot_spawn_z_offset > 0:
-            root_state = self.robot.data.root_state_w.clone()
-            root_state[env_ids, 2] += self.cfg.robot_spawn_z_offset
-            self.robot.write_root_state_to_sim(root_state, env_ids=env_ids)
     def set_curriculum_level(self, level: int):
         set_curriculum_level(self, level)
 

@@ -1,27 +1,42 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: BSD-3-Clause
 """
-TEKO Vision-Based Docking — PPO Training (Final Stable Version)
-Compatible with modular rewards, penalties, and sphere-contact termination.
+TEKO Vision-Based Docking — PPO Training (STABLE VERSION)
+Improved hyperparameters to prevent value function collapse.
 """
 
 import argparse
+import sys
+import os
+
 from isaaclab.app import AppLauncher
 
+# FORCE headless environment BEFORE anything else
+os.environ["OMNI_KIT_ALLOW_ROOT"] = "1"
+os.environ["DISPLAY"] = ""
+
+# Create custom args for AppLauncher with cameras enabled
+custom_args = argparse.Namespace(
+    headless=True,
+    enable_cameras=True,
+    experience='',
+    livestream=0
+)
+
+# Initialize AppLauncher with custom args that include enable_cameras
+app_launcher = AppLauncher(custom_args)
+simulation_app = app_launcher.app
+
+# NOW parse our training arguments
 parser = argparse.ArgumentParser()
 parser.add_argument("--num_envs", type=int, default=4)
-parser.add_argument("--headless", action="store_true")
 parser.add_argument("--timesteps", type=int, default=50_000)
 parser.add_argument("--seed", type=int, default=42)
-parser.add_argument("--checkpoint_every", type=int, default=10_000)
+parser.add_argument("--checkpoint_every", type=int, default=5_000)
 args, _ = parser.parse_known_args()
-
-app_launcher = AppLauncher(args_cli=args)
-simulation_app = app_launcher.app
 
 # ---------------------------------------------------------------------
 
-import os
 from datetime import datetime
 import torch
 import torch.nn as nn
@@ -44,7 +59,6 @@ from teko.tasks.direct.teko.teko_brain.cnn_model import create_visual_encoder
 # Wrappers
 # ======================================================================
 class RGBBoxWrapper:
-    """Extract 'policy' (or 'rgb') from dict obs and ensure float32 [0,1]."""
     def __init__(self, env):
         self.env = env
         h, w = env.cfg.camera.height, env.cfg.camera.width
@@ -69,7 +83,6 @@ class RGBBoxWrapper:
 
 
 class ActionBoxWrapper:
-    """Force actions to torch [num_envs, 2] on correct device."""
     def __init__(self, env):
         self.env = env
         self.num_envs = getattr(env.scene.cfg, "num_envs", 1)
@@ -145,18 +158,17 @@ class ValueNet(DeterministicMixin, Model):
 # ======================================================================
 def main():
     print("\n" + "=" * 78)
-    print("🚀 TEKO Vision-Based Docking — PPO Training")
+    print("🚀 TEKO Vision-Based Docking — STABLE PPO Training")
+    print("   Improved hyperparameters to prevent collapse")
     print("=" * 78 + "\n")
 
     set_seed(args.seed)
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-    # --- Env setup
     cfg = TekoEnvCfg()
     cfg.scene.num_envs = args.num_envs
     base_env = TekoEnv(cfg=cfg)
 
-    # Patch for tuple-safe prev_actions
     def _safe_pre_physics_step(actions):
         if isinstance(actions, tuple):
             actions = actions[0]
@@ -187,20 +199,22 @@ def main():
     print(f"✓ Policy params: {sum(p.numel() for p in policy.parameters()):,}")
     print(f"✓ Value  params: {sum(p.numel() for p in value.parameters()):,}")
 
-    # --- PPO config
+    # --- IMPROVED PPO CONFIG ---
     ppo_cfg = PPO_DEFAULT_CONFIG.copy()
     ppo_cfg.update({
-        "rollouts": 32,
-        "learning_epochs": 10,
-        "mini_batches": 4,
+        "rollouts": 64,
+        "learning_epochs": 8,
+        "mini_batches": 8,
         "discount_factor": 0.99,
         "lambda": 0.95,
-        "learning_rate": 3e-4,
+        "learning_rate": 1e-4,
+        
         "grad_norm_clip": 0.5,
         "ratio_clip": 0.2,
         "value_clip": 0.2,
-        "entropy_loss_scale": 0.01,
-        "value_loss_scale": 0.5,
+        "clip_predicted_values": True,
+        "entropy_loss_scale": 0.05,
+        "value_loss_scale": 0.25,
         "experiment": {"write_interval": 100},
     })
 
@@ -215,36 +229,36 @@ def main():
         device=device
     )
 
-    # --- Logging
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    save_dir = f"/workspace/teko/runs/teko_ppo_{timestamp}"
+    save_dir = f"/workspace/teko/runs/teko_ppo_stable_{timestamp}"
     os.makedirs(save_dir, exist_ok=True)
     writer = SummaryWriter(log_dir=save_dir)
     print(f"✓ TensorBoard: tensorboard --logdir /workspace/teko/runs")
 
-    # --- Hook (fixed signature)
     original_post = agent.post_interaction
 
     def logged_post_interaction(*, timestep, timesteps):
         original_post(timestep=timestep, timesteps=timesteps)
 
-        # Reward mean
         try:
             rewards = agent.memory.get_tensor_by_name("rewards")
             reward_mean = float(rewards.mean().item()) if rewards.numel() else 0.0
         except Exception:
             reward_mean = 0.0
 
-        # Policy loss
         policy_loss = 0.0
+        value_loss = 0.0
         td = getattr(agent, "tracking_data", {})
         if isinstance(td, dict):
             v = td.get("Loss / Policy loss", 0.0)
             policy_loss = float(v[-1] if isinstance(v, list) and v else v)
+            v = td.get("Loss / Value loss", 0.0)
+            value_loss = float(v[-1] if isinstance(v, list) and v else v)
 
         if timestep % 200 == 0:
             writer.add_scalar("Training/Reward_mean", reward_mean, timestep)
             writer.add_scalar("Training/Policy_loss", policy_loss, timestep)
+            writer.add_scalar("Training/Value_loss", value_loss, timestep)
 
             rc = getattr(base_env, "reward_components", None)
             if isinstance(rc, dict):
@@ -257,9 +271,8 @@ def main():
 
             pct = 100.0 * timestep / timesteps
             print(f"[{timestep:7d}/{timesteps}] {pct:5.1f}% | "
-                  f"R̄ {reward_mean:8.3f} | π-loss {policy_loss:8.5f}")
+                  f"R̄ {reward_mean:8.3f} | π-loss {policy_loss:8.5f} | v-loss {value_loss:7.2f}")
 
-        # Checkpointing
         if args.checkpoint_every > 0 and timestep > 0 and timestep % args.checkpoint_every == 0:
             ckpt_path = os.path.join(save_dir, f"ckpt_step_{timestep}.pt")
             agent.save(ckpt_path)
@@ -268,15 +281,15 @@ def main():
     agent.post_interaction = logged_post_interaction
 
     trainer = SequentialTrainer(
-        cfg={"timesteps": args.timesteps, "headless": args.headless},
+        cfg={"timesteps": args.timesteps, "headless": True},
         env=env,
         agents=agent
     )
 
     print(f"\n✓ Training: {args.num_envs} envs, {args.timesteps:,} steps")
-    print(f"✓ Save dir: {save_dir}")
-    print("\n" + "=" * 78)
-    print("🎓 Starting training...")
+    print(f"✓ Save dir: {save_dir}\n")
+    print("=" * 78)
+    print("🎓 Starting STABLE training...")
     print("=" * 78 + "\n")
 
     trainer.train()
