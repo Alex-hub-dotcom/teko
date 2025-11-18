@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: BSD-3-Clause
 """
-TEKO Vision-Based Docking — PPO Training (STABLE VERSION)
-Improved hyperparameters to prevent value function collapse.
+TEKO Vision-Based Docking — PPO Training (FIXED VERSION)
+Fixed PPO update triggering to ensure learning happens.
 """
 
 import argparse
@@ -158,8 +158,8 @@ class ValueNet(DeterministicMixin, Model):
 # ======================================================================
 def main():
     print("\n" + "=" * 78)
-    print("🚀 TEKO Vision-Based Docking — STABLE PPO Training")
-    print("   Improved hyperparameters to prevent collapse")
+    print("🚀 TEKO Vision-Based Docking — FIXED PPO Training")
+    print("   Fixed update triggering for proper learning")
     print("=" * 78 + "\n")
 
     set_seed(args.seed)
@@ -199,7 +199,7 @@ def main():
     print(f"✓ Policy params: {sum(p.numel() for p in policy.parameters()):,}")
     print(f"✓ Value  params: {sum(p.numel() for p in value.parameters()):,}")
 
-    # --- IMPROVED PPO CONFIG ---
+    # --- FIXED PPO CONFIG ---
     ppo_cfg = PPO_DEFAULT_CONFIG.copy()
     ppo_cfg.update({
         "rollouts": 64,
@@ -208,17 +208,31 @@ def main():
         "discount_factor": 0.99,
         "lambda": 0.95,
         "learning_rate": 1e-4,
-        
+        "random_timesteps": 0,
+        "learning_starts": 0,
         "grad_norm_clip": 0.5,
         "ratio_clip": 0.2,
         "value_clip": 0.2,
         "clip_predicted_values": True,
         "entropy_loss_scale": 0.05,
         "value_loss_scale": 0.25,
-        "experiment": {"write_interval": 100},
+        "state_preprocessor": None,
+        "state_preprocessor_kwargs": {},
+        "value_preprocessor": None,
+        "value_preprocessor_kwargs": {},
+        "rewards_shaper": None,  # ADD THIS LINE
+        "experiment": {
+            "write_interval": 200,
+            "checkpoint_interval": 0,
+        },
     })
 
-    memory = RandomMemory(memory_size=ppo_cfg["rollouts"], num_envs=args.num_envs, device=device)
+    # Force memory size to match rollouts exactly
+    memory = RandomMemory(
+        memory_size=64,  # Explicit size
+        num_envs=args.num_envs, 
+        device=device
+    )
 
     agent = PPO(
         models={"policy": policy, "value": value},
@@ -230,7 +244,7 @@ def main():
     )
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    save_dir = f"/workspace/teko/runs/teko_ppo_stable_{timestamp}"
+    save_dir = f"/workspace/teko/runs/teko_ppo_fixed_{timestamp}"
     os.makedirs(save_dir, exist_ok=True)
     writer = SummaryWriter(log_dir=save_dir)
     print(f"✓ TensorBoard: tensorboard --logdir /workspace/teko/runs")
@@ -289,7 +303,7 @@ def main():
     print(f"\n✓ Training: {args.num_envs} envs, {args.timesteps:,} steps")
     print(f"✓ Save dir: {save_dir}\n")
     print("=" * 78)
-    print("🎓 Starting STABLE training...")
+    print("🎓 Starting FIXED training...")
     print("=" * 78 + "\n")
 
     trainer.train()

@@ -1,43 +1,31 @@
 # SPDX-License-Identifier: BSD-3-Clause
 #
-# Reward functions for the TEKO environment (v3.2 FINAL)
-# ================================================
+# Reward functions for the TEKO environment (BALANCED v4.0)
+# ==========================================================
 
 from __future__ import annotations
 import torch
 import numpy as np
 
-from teko.tasks.direct.teko.penalties.penalties import (
-    compute_time_penalty,
-    compute_velocity_penalty_when_close,
-    compute_oscillation_penalty,
-    compute_wall_collision_penalty,
-    compute_robot_collision_penalty
-)
-
-def compute_total_reward(env) -> torch.Tensor:  # REMOVED TYPE HINT
-    """Compute total reward with STRONGER progress incentive."""
+def compute_total_reward(env) -> torch.Tensor:
+    """Compute BALANCED reward - prevent explosion."""
     
     # Get positions
     _, _, surface_xy, _ = env.get_sphere_distances_from_physics()
-    robot_pos = env.robot.data.root_pos_w
     
     # Initialize prev_distance if needed
     if env.prev_distance is None:
         env.prev_distance = surface_xy.clone()
     
-    # ===== 1. DISTANCE REWARD (primary signal) =====
-    # INCREASED weight from 2.0 to 5.0
-    distance_reward = -5.0 * surface_xy
+    # ===== 1. DISTANCE REWARD (normalized, capped) =====
+    # Use negative exponential to keep magnitude reasonable
+    distance_reward = -torch.exp(surface_xy) + 1.0  # Range: [-inf, 1]
+    distance_reward = torch.clamp(distance_reward, min=-10.0, max=1.0)  # Cap at -10
     
-    # ===== 2. PROGRESS REWARD (approach bonus) =====
+    # ===== 2. PROGRESS REWARD (moderate, symmetric) =====
     progress = env.prev_distance - surface_xy
-    # INCREASED multiplier from 10.0 to 30.0
-    progress_reward = torch.where(
-        progress > 0,
-        30.0 * progress,  # BIG reward for getting closer
-        5.0 * progress    # Small penalty for moving away
-    )
+    progress_reward = 10.0 * progress  # Same weight for approach/retreat
+    progress_reward = torch.clamp(progress_reward, min=-2.0, max=2.0)  # Cap magnitude
     env.prev_distance = surface_xy.clone()
     
     # ===== 3. ALIGNMENT REWARD =====
@@ -47,41 +35,53 @@ def compute_total_reward(env) -> torch.Tensor:  # REMOVED TYPE HINT
     ) * 2.0
     alignment_reward = 0.5 * torch.cos(active_yaw)
     
-    # ===== 4. VELOCITY PENALTY (REDUCED) =====
+    # ===== 4. VELOCITY PENALTY (very small) =====
     lin_vel = env.robot.data.root_lin_vel_w
     speed = torch.norm(lin_vel[:, :2], dim=-1)
-    # REDUCED from 0.05 to 0.01
-    velocity_penalty = -0.01 * speed
+    velocity_penalty = -0.005 * speed  # VERY small
     
-    # ===== 5. OSCILLATION PENALTY (REDUCED) =====
+    # ===== 5. OSCILLATION PENALTY (very small) =====
     if env.prev_actions is None:
         env.prev_actions = torch.zeros_like(env.actions)
     
     action_diff = torch.norm(env.actions - env.prev_actions, dim=-1)
-    # REDUCED from 0.1 to 0.02
-    oscillation_penalty = -0.02 * action_diff
+    oscillation_penalty = -0.01 * action_diff
     env.prev_actions = env.actions.clone()
     
-    # ===== 6. COLLISION PENALTY =====
-    collision_penalty = torch.zeros_like(surface_xy)
+    # ===== 6. OUT OF BOUNDS PENALTY =====
+    robot_pos_global = env.robot.data.root_pos_w
+    env_origins = env.scene.env_origins
+    robot_pos_local = robot_pos_global - env_origins
+    out_of_bounds = (
+        (torch.abs(robot_pos_local[:, 0]) > 1.4) |
+        (torch.abs(robot_pos_local[:, 1]) > 2.4)
+    )
+    boundary_penalty = torch.where(
+        out_of_bounds,
+        torch.tensor(-20.0, device=env.device),  # Big one-time penalty
+        torch.tensor(0.0, device=env.device)
+    )
     
     # ===== 7. SUCCESS BONUS =====
     success_bonus = torch.where(
         surface_xy < 0.03,
-        torch.tensor(50.0, device=env.device),  # HUGE bonus for docking!
+        torch.tensor(100.0, device=env.device),  # HUGE bonus!
         torch.tensor(0.0, device=env.device)
     )
     
-    # ===== TOTAL REWARD =====
+    # ===== TOTAL REWARD (CAPPED) =====
     total_reward = (
         distance_reward +
         progress_reward +
         alignment_reward +
         velocity_penalty +
         oscillation_penalty +
-        collision_penalty +
+        boundary_penalty +
         success_bonus
     )
+    
+    # CRITICAL: Cap total reward to prevent explosion
+    total_reward = torch.clamp(total_reward, min=-20.0, max=100.0)
     
     # Logging
     env.reward_components["distance"].append(distance_reward.mean().item())
@@ -91,28 +91,3 @@ def compute_total_reward(env) -> torch.Tensor:  # REMOVED TYPE HINT
     env.reward_components["oscillation_penalty"].append(oscillation_penalty.mean().item())
     
     return total_reward
-
-# ------------------------------------------------------------
-# Alignment Bonus
-# ------------------------------------------------------------
-def compute_alignment_bonus(env, surface_xy):
-    """Small bonus when close (<30 cm) and yaw error < 15°."""
-    robot_quat = env.robot.data.root_quat_w
-
-    # Extract yaw from quaternion
-    robot_yaw = torch.atan2(
-        2.0 * (robot_quat[:, 0] * robot_quat[:, 3] + robot_quat[:, 1] * robot_quat[:, 2]),
-        1.0 - 2.0 * (robot_quat[:, 2] ** 2 + robot_quat[:, 3] ** 2)
-    )
-
-    # Target yaw (facing the docking goal)
-    target_yaw = torch.tensor(np.pi, device=env.device)
-    yaw_error = torch.abs(robot_yaw - target_yaw)
-    yaw_error = torch.min(yaw_error, 2 * np.pi - yaw_error)
-
-    # Bonus if both close and well-aligned
-    is_close = surface_xy < 0.30
-    is_aligned = yaw_error < (15.0 * np.pi / 180.0)
-    return torch.where(is_close & is_aligned,
-                       torch.tensor(5.0, device=env.device),
-                       torch.tensor(0.0, device=env.device))
