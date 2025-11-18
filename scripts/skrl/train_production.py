@@ -319,22 +319,20 @@ def main():
         
         update_count += 1
         
-        # Logging
-        if step % 1000 == 0:
-            mean_reward = np.mean(episode_rewards) if episode_rewards else 0
-            mean_length = np.mean(episode_lengths) if episode_lengths else 0
-            success_rate = np.mean(episode_successes) if episode_successes else 0
+         # Logging (print every update)
+        mean_reward = np.mean(episode_rewards) if episode_rewards else 0
+        mean_length = np.mean(episode_lengths) if episode_lengths else 0
+        success_rate = np.mean(episode_successes) if episode_successes else 0
             
-            writer.add_scalar("train/reward", mean_reward, step)
-            writer.add_scalar("train/episode_length", mean_length, step)
-            writer.add_scalar("train/success_rate", success_rate, step)
-            writer.add_scalar("train/policy_loss", policy_loss, step)
-            writer.add_scalar("train/value_loss", value_loss, step)
-            writer.add_scalar("train/entropy", entropy, step)
+        writer.add_scalar("train/reward", mean_reward, step)
+        writer.add_scalar("train/episode_length", mean_length, step)
+        writer.add_scalar("train/success_rate", success_rate, step)
+        writer.add_scalar("train/policy_loss", policy_loss, step)
+        writer.add_scalar("train/value_loss", value_loss, step)
+        writer.add_scalar("train/entropy", entropy, step)
             
-            print(f"[{step:7d}] R={mean_reward:7.2f} | Len={mean_length:5.1f} | "
-                  f"Success={success_rate*100:4.1f}% | πL={policy_loss:.4f} | vL={value_loss:.3f}")
-        
+        print(f"[{step:7d}] R={mean_reward:7.2f} | Len={mean_length:5.1f} | "
+            f"Success={success_rate*100:4.1f}% | πL={policy_loss:.4f} | vL={value_loss:.3f}")
         # Checkpoint
         if step % 10000 == 0 and step > 0:
             torch.save({
