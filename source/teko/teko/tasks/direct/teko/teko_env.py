@@ -257,17 +257,11 @@ class TekoEnv(DirectRLEnv):
     # Dones (WITH COLLISION RESET)
     # ------------------------------------------------------------------
     def _get_dones(self):
-        """
-        Terminate when:
-        1. Success: Spheres within 3cm
-        2. Out of bounds: Robot left arena
-        3. Collision: Robot crashed into goal (too close, moving too fast)
-        """
+        """Terminate when: success, out of bounds, collision, OR timeout"""
         _, _, surface_xy, _ = self.get_sphere_distances_from_physics()
 
         # SUCCESS
-        success_threshold = 0.03
-        success = surface_xy < success_threshold
+        success = surface_xy < 0.03
 
         # OUT OF BOUNDS
         robot_pos_global = self.robot.data.root_pos_w
@@ -278,20 +272,21 @@ class TekoEnv(DirectRLEnv):
             (torch.abs(robot_pos_local[:, 1]) > 2.4)
         )
         
-        # COLLISION: Too close but moving too fast (crashed)
+        # COLLISION
         lin_vel = self.robot.data.root_lin_vel_w
         speed = torch.norm(lin_vel[:, :2], dim=-1)
         collision = (surface_xy < 0.10) & (speed > 0.4) & ~success
 
         terminated = success | out_of_bounds | collision
-        time_out = torch.zeros_like(terminated, device=self.device)
+        
+        # TIMEOUT - episodes reaching max length
+        time_out = self.episode_length_buf >= self.max_episode_length
 
         if success.any():
-            self.episode_successes.append(success.sum().item())
-            print(f"[SUCCESS] {success.sum().item()} successful docking(s).")
+            print(f"[SUCCESS] {success.sum().item()} dockings!")
+        
 
         return terminated, time_out
-
     # ------------------------------------------------------------------
     # Reset
     # ------------------------------------------------------------------

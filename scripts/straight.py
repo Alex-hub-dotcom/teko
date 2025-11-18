@@ -13,11 +13,10 @@ import time
 import random
 import numpy as np
 
-
 # ----------------------------------------------------------------------
 # Parameters
 # ----------------------------------------------------------------------
-FORWARD_TORQUE = 1.0          # Normalized torque command [-1, 1]
+FORWARD_TORQUE = 0.5          # Normalized torque command [-1, 1]
 DURATION = 10.0               # Duration in seconds
 STEP_HZ = 60                  # Simulation frequency (Hz)
 HEADLESS = False              # Set True for offscreen/headless run
@@ -25,9 +24,12 @@ HEADLESS = False              # Set True for offscreen/headless run
 
 def main(headless=HEADLESS):
     # ------------------------------------------------------------------
-    # 1. Launch Isaac Lab application
+    # 1. Launch Isaac Lab application (with cameras enabled)
     # ------------------------------------------------------------------
-    app_launcher = AppLauncher(headless=headless)
+    app_launcher = AppLauncher(
+        headless=headless,
+        enable_cameras=True,   # IMPORTANT: allow camera sensors to spawn
+    )
     app = app_launcher.app
 
     # ------------------------------------------------------------------
@@ -70,11 +72,20 @@ def main(headless=HEADLESS):
         env.step(torque_cmd)
         app.update()
 
-        # Periodic position print
+        # Periodic state print (1x per second)
         if step % STEP_HZ == 0:
             pos = env.robot.data.root_pos_w[0].cpu().numpy()
-            print(f"[{time.time()-t0:05.2f}s] Position: x={pos[0]:.3f}, y={pos[1]:.3f}, z={pos[2]:.3f}")
+            lin_vel = env.robot.data.root_lin_vel_w[0].cpu().numpy()
+            ang_vel = env.robot.data.root_ang_vel_w[0].cpu().numpy()
+            elapsed = time.time() - t0
+            print(
+                f"[{elapsed:05.2f}s] "
+                f"pos(x={pos[0]:.3f}, y={pos[1]:.3f}, z={pos[2]:.3f}) | "
+                f"lin_vel=({lin_vel[0]:.3f}, {lin_vel[1]:.3f}, {lin_vel[2]:.3f}) | "
+                f"ang_vel=({ang_vel[0]:.3f}, {ang_vel[1]:.3f}, {ang_vel[2]:.3f})"
+            )
 
+        # Optional: run approximately in real time
         time.sleep(1.0 / STEP_HZ)
 
     # ------------------------------------------------------------------

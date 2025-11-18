@@ -21,36 +21,37 @@ TEKO_CONFIGURATION = ArticulationCfg(
         usd_path=TEKO_PATH,
         articulation_props=sim_utils.ArticulationRootPropertiesCfg(
             enabled_self_collisions=False,
-            solver_position_iteration_count=8,
-            solver_velocity_iteration_count=2,
-            sleep_threshold=0.005,
-            stabilization_threshold=0.001,
+            solver_position_iteration_count=16,  # Higher for stability
+            solver_velocity_iteration_count=4,
+            sleep_threshold=0.001,
+            stabilization_threshold=0.0001,
         ),
         activate_contact_sensors=False,
         rigid_props=sim_utils.RigidBodyPropertiesCfg(
             disable_gravity=False,
-            linear_damping=0.01,
-            angular_damping=0.05,
+            linear_damping=0.3,      # was 0.1
+            angular_damping=0.3,     # was 0.15
+            max_linear_velocity=2.0,
+            max_angular_velocity=10.0,
         ),
         collision_props=sim_utils.CollisionPropertiesCfg(
-            contact_offset=0.002,
+            contact_offset=0.005,    # a bit more tolerance
             rest_offset=0.0,
-            torsional_patch_radius=0.002,
+            torsional_patch_radius=0.003,
         ),
     ),
     init_state=ArticulationCfg.InitialStateCfg(
         joint_pos={joint: 0.0 for joint in WHEEL_JOINTS},
         joint_vel={joint: 0.0 for joint in WHEEL_JOINTS},
     ),
-   actuators={
+    actuators={
         "wheel_actuators": ImplicitActuatorCfg(
             joint_names_expr=WHEEL_JOINTS,
-            effort_limit_sim=5.0,    # ← Back to 5.0 Nm
+            effort_limit_sim=1.0,  # ↓ less torque
             stiffness=0.0,
-            damping=1.0,             # ← Back to 1.0
-            friction=0.3,            # ← Reduce friction
-            armature=0.0005,
+            damping=0.5,           # slightly softer
+            friction=0.1,          # less joint friction
+            armature=0.001,        # a bit more inertia
         ),
     },
-
 )
