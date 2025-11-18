@@ -12,6 +12,6 @@ gym.register(
     disable_env_checker=True,
     kwargs={
         "env_cfg_entry_point": "teko.tasks.direct.teko.teko_env_cfg:TekoEnvCfg",
-        "skrl_cfg_entry_point": "teko.tasks.direct.teko.agents:skrl_ppo_cfg.yaml",
+        "skrl_cfg_entry_point": "teko.tasks.direct.teko.teko_brain:skrl_ppo_cfg.yaml",
     },
 )

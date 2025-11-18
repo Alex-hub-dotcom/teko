@@ -1,4 +1,16 @@
-# Copyright (c) 2022-2025, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
-# All rights reserved.
-#
-# SPDX-License-Identifier: BSD-3-Clause
+"""
+TEKO Brain Module
+----------------
+Contains CNN models and PPO policy/value networks for vision-based docking.
+"""
+
+from .cnn_model import create_visual_encoder, DockingCNN, SimpleCNN
+from .ppo_policy import PolicyNetwork, ValueNetwork
+
+__all__ = [
+    "create_visual_encoder",
+    "DockingCNN", 
+    "SimpleCNN",
+    "PolicyNetwork",
+    "ValueNetwork",
+]

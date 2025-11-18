@@ -258,7 +258,7 @@ class TekoEnv(DirectRLEnv):
                 
                 rgb_obs[env_idx] = rgb
 
-        return {"policy": rgb_obs}
+        return {"rgb": rgb_obs}
 
     # ------------------------------------------------------------------
     # Rewards
