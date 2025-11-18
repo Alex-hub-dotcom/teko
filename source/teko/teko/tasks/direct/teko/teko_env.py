@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: BSD-3-Clause
 #
-# TEKO Environment — Modular Version (Torque-driven, Multi-env)
+# TEKO Environment — Final Version with Collision Reset
 # -------------------------------------------------------------
 
 from __future__ import annotations
@@ -11,7 +11,7 @@ from pxr import Sdf, UsdGeom, UsdLux, Gf
 from isaaclab.assets import Articulation
 from isaaclab.envs import DirectRLEnv
 from isaaclab.sim import SimulationContext
-from isaaclab.sensors import Camera, CameraCfg  # FIXED IMPORT
+from isaaclab.sensors import Camera, CameraCfg
 
 from .teko_env_cfg import TekoEnvCfg
 from .rewards.reward_functions import compute_total_reward
@@ -22,7 +22,7 @@ from .robots.teko_static import TEKOStatic
 
 
 class TekoEnv(DirectRLEnv):
-    """Torque-driven TEKO environment with multi-env support."""
+    """Torque-driven TEKO environment with multi-env support and collision reset."""
 
     cfg: TekoEnvCfg
 
@@ -112,7 +112,7 @@ class TekoEnv(DirectRLEnv):
             except Exception as e:
                 print(f"[WARN] Arena failed for env_{env_idx}: {e}")
 
-            # Active robot start
+            # Active robot start position
             robot_prim = stage.GetPrimAtPath(f"{env_path}/Robot")
             if robot_prim.IsValid():
                 xf_robot = UsdGeom.Xformable(robot_prim)
@@ -140,17 +140,15 @@ class TekoEnv(DirectRLEnv):
                 "TEKO_WallBack/TEKO_Camera/RearCamera"
             )
             
-            # Create camera config
             cam_cfg = CameraCfg(
                 prim_path=cam_path,
-                update_period=0,  # Update every step
+                update_period=0,
                 height=self._cam_res[1],
                 width=self._cam_res[0],
                 data_types=["rgb"],
-                spawn=None,  # Camera already exists in USD
+                spawn=None,
             )
             
-            # Create camera sensor
             camera = Camera(cfg=cam_cfg)
             self.cameras.append(camera)
         
@@ -165,28 +163,23 @@ class TekoEnv(DirectRLEnv):
         print(f"[INFO] Cached {num_envs} goal positions.")
 
     # ------------------------------------------------------------------
-    # Sphere position computation
+    # Sphere position computation (docking measurement)
     # ------------------------------------------------------------------
     def get_sphere_distances_from_physics(self):
-        """Get sphere distances using fixed world-space offsets (no rotation needed)."""
-        # Calibrated offsets in world space
+        """Get sphere distances for docking measurement."""
         FEMALE_OFFSET = torch.tensor([0.24, 0.0, -0.08], device=self.device)
         MALE_OFFSET = torch.tensor([0.22667, -0.00144, -0.08815], device=self.device)
 
-        # Robot positions
-        active_pos = self.robot.data.root_pos_w  # (num_envs, 3)
-        static_pos = self.goal_positions  # (num_envs, 3)
+        active_pos = self.robot.data.root_pos_w
+        static_pos = self.goal_positions
         
-        # Apply offsets directly (no rotation - both robots face same direction)
         female_pos = active_pos + FEMALE_OFFSET.unsqueeze(0).expand(active_pos.shape[0], 3)
         male_pos = static_pos + MALE_OFFSET.unsqueeze(0).expand(static_pos.shape[0], 3)
         
-        # Compute distances
         diff = female_pos - male_pos
-        dist_3d = torch.norm(diff, dim=-1)  # (num_envs,)
-        dist_xy = torch.norm(diff[:, :2], dim=-1)  # (num_envs,)
+        dist_3d = torch.norm(diff, dim=-1)
+        dist_xy = torch.norm(diff[:, :2], dim=-1)
         
-        # Subtract sphere radii
         R_FEMALE = 0.005
         R_MALE = 0.005
         surface_3d = torch.clamp(dist_3d - (R_FEMALE + R_MALE), min=0.0)
@@ -234,25 +227,18 @@ class TekoEnv(DirectRLEnv):
         rgb_obs = torch.zeros((num_envs, 3, h, w), device=self.device)
 
         for env_idx, cam in enumerate(self.cameras):
-            # Update camera data
             cam.update(dt=0.0)
             
-            # Get RGB data
             rgb_data = cam.data.output["rgb"]
             if rgb_data is not None and rgb_data.numel() > 0:
-                # rgb_data shape: (1, H, W, 4) or (1, H, W, 3)
-                # Remove batch dimension if present
                 if rgb_data.ndim == 4:
-                    rgb_data = rgb_data.squeeze(0)  # Now (H, W, C)
+                    rgb_data = rgb_data.squeeze(0)
                 
-                # Remove alpha channel if present
                 if rgb_data.shape[-1] == 4:
-                    rgb_data = rgb_data[..., :3]  # Now (H, W, 3)
+                    rgb_data = rgb_data[..., :3]
                 
-                # Convert to (3, H, W) and normalize
                 rgb = rgb_data.permute(2, 0, 1).float() / 255.0
                 
-                # Resize if needed
                 if rgb.shape[1] != h or rgb.shape[2] != w:
                     rgb = F.interpolate(rgb.unsqueeze(0), size=(h, w), mode="bilinear", align_corners=False).squeeze(0)
                 
@@ -268,16 +254,22 @@ class TekoEnv(DirectRLEnv):
         return compute_total_reward(self)
 
     # ------------------------------------------------------------------
-    # Dones
+    # Dones (WITH COLLISION RESET)
     # ------------------------------------------------------------------
     def _get_dones(self):
-        """Terminate when spheres touch or robot leaves the arena."""
+        """
+        Terminate when:
+        1. Success: Spheres within 3cm
+        2. Out of bounds: Robot left arena
+        3. Collision: Robot crashed into goal (too close, moving too fast)
+        """
         _, _, surface_xy, _ = self.get_sphere_distances_from_physics()
 
-        success_threshold = 0.03  # 3 cm contact
+        # SUCCESS
+        success_threshold = 0.03
         success = surface_xy < success_threshold
 
-        # Local coordinates for arena boundaries
+        # OUT OF BOUNDS
         robot_pos_global = self.robot.data.root_pos_w
         env_origins = self.scene.env_origins
         robot_pos_local = robot_pos_global - env_origins
@@ -285,8 +277,13 @@ class TekoEnv(DirectRLEnv):
             (torch.abs(robot_pos_local[:, 0]) > 1.4) |
             (torch.abs(robot_pos_local[:, 1]) > 2.4)
         )
+        
+        # COLLISION: Too close but moving too fast (crashed)
+        lin_vel = self.robot.data.root_lin_vel_w
+        speed = torch.norm(lin_vel[:, :2], dim=-1)
+        collision = (surface_xy < 0.10) & (speed > 0.4) & ~success
 
-        terminated = success | out_of_bounds
+        terminated = success | out_of_bounds | collision
         time_out = torch.zeros_like(terminated, device=self.device)
 
         if success.any():
@@ -302,7 +299,6 @@ class TekoEnv(DirectRLEnv):
         super()._reset_idx(env_ids)
         self._lazy_init_articulation()
         
-        # Reset state tracking
         if self.prev_distance is None:
             self.prev_distance = torch.zeros(self.scene.cfg.num_envs, device=self.device)
         if self.prev_actions is None:
@@ -317,8 +313,5 @@ class TekoEnv(DirectRLEnv):
     def set_curriculum_level(self, level: int):
         set_curriculum_level(self, level)
 
-    # ------------------------------------------------------------------
-    # Logging
-    # ------------------------------------------------------------------
     def get_episode_statistics(self):
         return collect_episode_stats(self)
