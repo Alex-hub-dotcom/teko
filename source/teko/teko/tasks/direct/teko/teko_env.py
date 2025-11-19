@@ -257,13 +257,20 @@ class TekoEnv(DirectRLEnv):
     # Dones (WITH COLLISION RESET)
     # ------------------------------------------------------------------
     def _get_dones(self):
-        """Terminate when: success, out of bounds, collision, OR timeout"""
+        """Terminate when: success, out of bounds, collision, OR timeout."""
         _, _, surface_xy, _ = self.get_sphere_distances_from_physics()
 
-        # SUCCESS
-        success = surface_xy < 0.03
+        # --- step-based gates to avoid Len = 1 exploits
+        min_success_steps = 5      # require some interaction before counting success
+        min_collision_steps = 2    # allow early crashes, but not at step 0/1
 
-        # OUT OF BOUNDS
+        # Raw geometric success (distance-only)
+        raw_success = surface_xy < 0.03
+
+        # Only count success as terminal after a few steps
+        success = raw_success & (self.episode_length_buf >= min_success_steps)
+
+        # OUT OF BOUNDS (local coords in arena frame)
         robot_pos_global = self.robot.data.root_pos_w
         env_origins = self.scene.env_origins
         robot_pos_local = robot_pos_global - env_origins
@@ -271,22 +278,26 @@ class TekoEnv(DirectRLEnv):
             (torch.abs(robot_pos_local[:, 0]) > 1.4) |
             (torch.abs(robot_pos_local[:, 1]) > 2.4)
         )
-        
-        # COLLISION
+
+        # COLLISION (don't kill instantly on step 0/1)
         lin_vel = self.robot.data.root_lin_vel_w
         speed = torch.norm(lin_vel[:, :2], dim=-1)
-        collision = (surface_xy < 0.10) & (speed > 0.4) & ~success
+        collision = (
+            (surface_xy < 0.10) &
+            (speed > 0.4) &
+            ~raw_success &
+            (self.episode_length_buf >= min_collision_steps)
+        )
 
+        # Termination & timeout
         terminated = success | out_of_bounds | collision
-        
-        # TIMEOUT - episodes reaching max length
         time_out = self.episode_length_buf >= self.max_episode_length
 
         if success.any():
-            print(f"[SUCCESS] {success.sum().item()} dockings!")
-        
+            print(f"[SUCCESS] {int(success.sum().item())} dockings!")
 
         return terminated, time_out
+
     # ------------------------------------------------------------------
     # Reset
     # ------------------------------------------------------------------
