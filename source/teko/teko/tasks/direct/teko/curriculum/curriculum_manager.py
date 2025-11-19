@@ -42,14 +42,14 @@ def reset_environment_curriculum(env, env_ids):
 
 
 # ============================================================================
-# Stage 0: Baby Steps (0.15-0.25m, 0° yaw)
+# Stage 0: Baby Steps (0.05-0.15m, 0° yaw) - RIDICULOUSLY EASY!
 # ============================================================================
 def _reset_stage0_baby_steps(env, env_ids):
-    """Very close, perfectly aligned - just learn to move forward."""
+    """SUPER close, perfectly aligned - just breathe forward."""
     num_reset = len(env_ids)
     
-    # Distance: 0.15-0.25m
-    spawn_distance = torch.rand(num_reset, device=env.device) * 0.10 + 0.15
+    # Distance: 0.05-0.15m (was 0.15-0.25m)
+    spawn_distance = torch.rand(num_reset, device=env.device) * 0.10 + 0.05
     
     # Yaw: 180° (facing goal, perfect alignment)
     spawn_yaw = torch.ones(num_reset, device=env.device) * np.pi

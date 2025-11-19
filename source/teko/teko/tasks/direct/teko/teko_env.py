@@ -262,7 +262,7 @@ class TekoEnv(DirectRLEnv):
 
         # --- step-based gates to avoid Len = 1 exploits
         min_success_steps = 5      # require some interaction before counting success
-        min_collision_steps = 2    # allow early crashes, but not at step 0/1
+        min_collision_steps = 10    # allow early crashes, but not at step 0/1
 
         # Raw geometric success (distance-only)
         raw_success = surface_xy < 0.03
