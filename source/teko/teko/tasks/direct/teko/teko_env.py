@@ -304,17 +304,27 @@ class TekoEnv(DirectRLEnv):
     def _reset_idx(self, env_ids):
         super()._reset_idx(env_ids)
         self._lazy_init_articulation()
-        
+
+        # Lazy init buffers
+        num_envs = self.scene.cfg.num_envs
         if self.prev_distance is None:
-            self.prev_distance = torch.zeros(self.scene.cfg.num_envs, device=self.device)
+            self.prev_distance = torch.zeros(num_envs, device=self.device)
         if self.prev_actions is None:
-            self.prev_actions = torch.zeros((self.scene.cfg.num_envs, 2), device=self.device)
+            self.prev_actions = torch.zeros((num_envs, 2), device=self.device)
         if self.step_count is None:
-            self.step_count = torch.zeros(self.scene.cfg.num_envs, dtype=torch.int32, device=self.device)
-        
-        self.prev_distance[env_ids] = 0.0
+            self.step_count = torch.zeros(num_envs, dtype=torch.int32, device=self.device)
+
+        # Reset per-episode state for these envs
         self.prev_actions[env_ids] = 0.0
         self.step_count[env_ids] = 0
+
+        # Spawn according to curriculum
+        reset_environment_curriculum(self, env_ids)
+
+        # After teleporting, recompute initial distance for progress reward
+        _, _, surface_xy, _ = self.get_sphere_distances_from_physics()
+        self.prev_distance[env_ids] = surface_xy[env_ids]
+
 
     def set_curriculum_level(self, level: int):
         set_curriculum_level(self, level)

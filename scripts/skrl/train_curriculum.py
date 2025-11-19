@@ -187,6 +187,7 @@ def main():
     
     step = 0
     steps_in_stage = 0
+    next_stage_check = 10000
     
     while step < args.steps:
         obs_buf, act_buf, rew_buf, val_buf, logp_buf, done_buf = [], [], [], [], [], []
@@ -254,13 +255,15 @@ def main():
         print(f"[{step:7d}] Stage{env.curriculum_level} | R={mean_reward:6.1f} | "
               f"Len={mean_length:4.0f} | Success={success_rate*100:4.1f}% | "
               f"Stage_SR={stage_success*100:4.1f}%")
-        
-        # Check advancement (every 5k steps, min 10k per stage)
-        if step % 5000 == 0 and steps_in_stage >= 10000:
+
+        # Curriculum advancement: after enough env-steps in this stage
+        if steps_in_stage >= next_stage_check:
             if should_advance_curriculum(stage_success, env.curriculum_level):
                 env.set_curriculum_level(env.curriculum_level + 1)
                 stage_success_window.clear()
                 steps_in_stage = 0
+                next_stage_check = 10000   # require 10k steps in each new stage
+
                 print(f"\n{'='*70}")
                 print(f"🎓 ADVANCED! {STAGE_NAMES[env.curriculum_level]}")
                 print(f"{'='*70}\n")

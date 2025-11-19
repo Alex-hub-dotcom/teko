@@ -67,7 +67,7 @@ def compute_total_reward(env) -> torch.Tensor:
     
     collision_penalty = torch.where(
         collision,
-        torch.tensor(-200.0, device=env.device),  # MASSIVE penalty!
+        torch.tensor(-500.0, device=env.device),  # NUCLEAR penalty!
         torch.tensor(0.0, device=env.device)
     )
     
@@ -83,7 +83,7 @@ def compute_total_reward(env) -> torch.Tensor:
     
     boundary_penalty = torch.where(
         out_of_bounds,
-        torch.tensor(-200.0, device=env.device),  # MASSIVE penalty!
+        torch.tensor(-500.0, device=env.device),  # NUCLEAR penalty!
         torch.tensor(0.0, device=env.device)
     )
     
@@ -105,8 +105,8 @@ def compute_total_reward(env) -> torch.Tensor:
     )
     
     # ===== 10. SURVIVAL BONUS (anti-crash exploit) =====
-    # Small reward for each step survived - makes timeout better than crash
-    survival_bonus = torch.full_like(surface_xy, 0.15)
+    # STRONG reward for each step survived - makes timeout >> crash
+    survival_bonus = torch.full_like(surface_xy, 0.3)  # Was 0.15, now 0.3!
     
     # ===== TOTAL REWARD =====
     total_reward = (
@@ -122,8 +122,8 @@ def compute_total_reward(env) -> torch.Tensor:
         survival_bonus           # NEW!
     )
     
-    # Safety clamp (collision/boundary can go to -200)
-    total_reward = torch.clamp(total_reward, min=-200.0, max=100.0)
+    # Safety clamp (collision/boundary can go to -500; success+survival can exceed 100)
+    total_reward = torch.clamp(total_reward, min=-500.0, max=400.0)
     
     # ===== LOGGING =====
     env.reward_components["distance"].append(distance_reward.mean().item())
