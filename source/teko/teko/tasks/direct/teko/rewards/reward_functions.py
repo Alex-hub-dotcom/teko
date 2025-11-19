@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: BSD-3-Clause
 #
-# Reward functions for the TEKO environment (OPTIMIZED v5.0)
-# ===========================================================
+# Reward functions for the TEKO environment (OPTIMIZED v6.0 - ANTI-EXPLOIT)
+# ===========================================================================
 
 from __future__ import annotations
 import torch
@@ -17,8 +17,9 @@ def compute_total_reward(env) -> torch.Tensor:
     3. Alignment reward: Encourages correct orientation
     4. Velocity penalty: Discourages excessive speed
     5. Oscillation penalty: Discourages jerky movements
-    6. Boundary penalty: Heavily penalizes leaving arena
-    7. Success bonus: Large reward for successful docking
+    6. Collision penalty: HUGE penalty for crashing (prevents exploit)
+    7. Boundary penalty: HUGE penalty for leaving arena
+    8. Success bonus: Large reward for successful docking
     """
     
     # Get sphere distances
@@ -60,7 +61,17 @@ def compute_total_reward(env) -> torch.Tensor:
     oscillation_penalty = -0.02 * action_diff
     env.prev_actions = env.actions.clone()
     
-    # ===== 6. BOUNDARY PENALTY =====
+    # ===== 6. COLLISION PENALTY (ANTI-EXPLOIT!) =====
+    # Detect collision: too close + moving fast = crash
+    collision = (surface_xy < 0.10) & (speed > 0.3) & (surface_xy >= 0.03)
+    
+    collision_penalty = torch.where(
+        collision,
+        torch.tensor(-200.0, device=env.device),  # MASSIVE penalty!
+        torch.tensor(0.0, device=env.device)
+    )
+    
+    # ===== 7. BOUNDARY PENALTY (ANTI-EXPLOIT!) =====
     robot_pos_global = env.robot.data.root_pos_w
     env_origins = env.scene.env_origins
     robot_pos_local = robot_pos_global - env_origins
@@ -72,11 +83,11 @@ def compute_total_reward(env) -> torch.Tensor:
     
     boundary_penalty = torch.where(
         out_of_bounds,
-        torch.tensor(-50.0, device=env.device),  # Large penalty
+        torch.tensor(-200.0, device=env.device),  # MASSIVE penalty!
         torch.tensor(0.0, device=env.device)
     )
     
-    # ===== 7. SUCCESS BONUS =====
+    # ===== 8. SUCCESS BONUS =====
     success = surface_xy < 0.03  # Within 3cm = success
     success_bonus = torch.where(
         success,
@@ -84,9 +95,9 @@ def compute_total_reward(env) -> torch.Tensor:
         torch.tensor(0.0, device=env.device)
     )
     
-    # ===== 8. PROXIMITY BONUS (helps final approach) =====
+    # ===== 9. PROXIMITY BONUS (helps final approach) =====
     # Extra reward when very close to encourage final docking
-    close = (surface_xy < 0.10) & (surface_xy >= 0.03)
+    close = (surface_xy < 0.10) & (surface_xy >= 0.03) & ~collision
     proximity_bonus = torch.where(
         close,
         torch.tensor(2.0, device=env.device),
@@ -100,13 +111,14 @@ def compute_total_reward(env) -> torch.Tensor:
         alignment_reward +
         velocity_penalty +
         oscillation_penalty +
+        collision_penalty +      # NOW INCLUDED!
         boundary_penalty +
         success_bonus +
         proximity_bonus
     )
     
-    # Safety clamp (should rarely trigger with balanced components)
-    total_reward = torch.clamp(total_reward, min=-50.0, max=100.0)
+    # Safety clamp (collision/boundary can go to -200)
+    total_reward = torch.clamp(total_reward, min=-200.0, max=100.0)
     
     # ===== LOGGING =====
     env.reward_components["distance"].append(distance_reward.mean().item())
@@ -114,5 +126,7 @@ def compute_total_reward(env) -> torch.Tensor:
     env.reward_components["alignment"].append(alignment_reward.mean().item())
     env.reward_components["velocity_penalty"].append(velocity_penalty.mean().item())
     env.reward_components["oscillation_penalty"].append(oscillation_penalty.mean().item())
+    env.reward_components["collision_penalty"].append(collision_penalty.mean().item())
+    env.reward_components["wall_penalty"].append(boundary_penalty.mean().item())
     
     return total_reward
