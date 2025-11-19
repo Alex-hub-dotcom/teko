@@ -30,7 +30,8 @@ class TekoEnvCfg(DirectRLEnvCfg):
     # ------------------------------------------------------------------
     decimation = 2
     episode_length_s = 15.0  # SHORTER: 15 seconds instead of 30
-
+    enable_curriculum = False 
+    
     # ------------------------------------------------------------------
     # Simulation setup
     # ------------------------------------------------------------------
