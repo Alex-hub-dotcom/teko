@@ -1,7 +1,12 @@
 # SPDX-License-Identifier: BSD-3-Clause
-#
-# TEKO Environment — Final Version with Collision Reset
-# -------------------------------------------------------------
+"""
+TEKO Environment - 12-Stage Curriculum Compatible
+==================================================
+- Supports 12-stage curriculum (0-11)
+- Nuclear penalties (-500 collision/boundary)
+- Survival bonus (+0.3/step)
+- Anti-crash exploit (min_collision_steps=10)
+"""
 
 from __future__ import annotations
 import numpy as np
@@ -22,7 +27,7 @@ from .robots.teko_static import TEKOStatic
 
 
 class TekoEnv(DirectRLEnv):
-    """Torque-driven TEKO environment with multi-env support and collision reset."""
+    """Torque-driven TEKO environment with 12-stage curriculum."""
 
     cfg: TekoEnvCfg
 
@@ -35,7 +40,7 @@ class TekoEnv(DirectRLEnv):
         self.goal_positions = None
         self.num_agents = 1
 
-        # Curriculum learning
+        # Curriculum learning (12 stages: 0-11)
         self.curriculum_level = 0
 
         # State tracking
@@ -79,9 +84,14 @@ class TekoEnv(DirectRLEnv):
         import gymnasium as gym
         frame_shape = (3, self.cfg.camera.height, self.cfg.camera.width)
         self.observation_space = gym.spaces.Dict({
-            "rgb": gym.spaces.Box(low=0, high=255, shape=frame_shape, dtype=np.uint8)
+            "rgb": gym.spaces.Box(
+                low=0.0,
+                high=1.0,
+                shape=frame_shape,
+                dtype=np.float32,
+            )
         })
-        print(f"[INFO] Observation space set to {frame_shape}")
+        print(f"[INFO] Observation space set to {frame_shape}, range [0, 1]")
 
     def _setup_global_lighting(self, stage):
         if stage.GetPrimAtPath("/World/DomeLight"):
@@ -250,27 +260,26 @@ class TekoEnv(DirectRLEnv):
     # Rewards
     # ------------------------------------------------------------------
     def _get_rewards(self):
-        from teko.tasks.direct.teko.rewards.reward_functions import compute_total_reward
         return compute_total_reward(self)
 
     # ------------------------------------------------------------------
-    # Dones (WITH COLLISION RESET)
+    # Dones (NUCLEAR PENALTIES: -500)
     # ------------------------------------------------------------------
     def _get_dones(self):
         """Terminate when: success, out of bounds, collision, OR timeout."""
         _, _, surface_xy, _ = self.get_sphere_distances_from_physics()
 
-        # --- step-based gates to avoid Len = 1 exploits
-        min_success_steps = 5      # require some interaction before counting success
-        min_collision_steps = 10    # allow early crashes, but not at step 0/1
+        # Anti-exploit gates
+        min_success_steps = 5
+        min_collision_steps = 10  # ANTI-CRASH EXPLOIT
 
-        # Raw geometric success (distance-only)
+        # Raw geometric success
         raw_success = surface_xy < 0.03
 
-        # Only count success as terminal after a few steps
+        # Only count success as terminal after min steps
         success = raw_success & (self.episode_length_buf >= min_success_steps)
 
-        # OUT OF BOUNDS (local coords in arena frame)
+        # OUT OF BOUNDS (-500 penalty in rewards)
         robot_pos_global = self.robot.data.root_pos_w
         env_origins = self.scene.env_origins
         robot_pos_local = robot_pos_global - env_origins
@@ -279,7 +288,7 @@ class TekoEnv(DirectRLEnv):
             (torch.abs(robot_pos_local[:, 1]) > 2.4)
         )
 
-        # COLLISION (don't kill instantly on step 0/1)
+        # COLLISION (-500 penalty in rewards)
         lin_vel = self.robot.data.root_lin_vel_w
         speed = torch.norm(lin_vel[:, :2], dim=-1)
         collision = (
@@ -299,7 +308,7 @@ class TekoEnv(DirectRLEnv):
         return terminated, time_out
 
     # ------------------------------------------------------------------
-    # Reset
+    # Reset (USES 12-STAGE CURRICULUM)
     # ------------------------------------------------------------------
     def _reset_idx(self, env_ids):
         super()._reset_idx(env_ids)
@@ -314,19 +323,19 @@ class TekoEnv(DirectRLEnv):
         if self.step_count is None:
             self.step_count = torch.zeros(num_envs, dtype=torch.int32, device=self.device)
 
-        # Reset per-episode state for these envs
+        # Reset per-episode state
         self.prev_actions[env_ids] = 0.0
         self.step_count[env_ids] = 0
 
-        # Spawn according to curriculum
+        # Spawn according to 12-STAGE curriculum
         reset_environment_curriculum(self, env_ids)
 
-        # After teleporting, recompute initial distance for progress reward
+        # Recompute initial distance for progress reward
         _, _, surface_xy, _ = self.get_sphere_distances_from_physics()
         self.prev_distance[env_ids] = surface_xy[env_ids]
 
-
     def set_curriculum_level(self, level: int):
+        """Set curriculum level (0-11)."""
         set_curriculum_level(self, level)
 
     def get_episode_statistics(self):

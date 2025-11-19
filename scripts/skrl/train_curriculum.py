@@ -1,15 +1,11 @@
 #!/usr/bin/env python3
 """
-TEKO Vision Docking - 6-Stage Curriculum PPO Training
-======================================================
-Stage 0: Baby Steps (0.15-0.25m, 0° yaw)
-Stage 1: Forward Drive (0.3-0.6m, 0° yaw)
-Stage 2: Lateral Alignment (0.3-0.6m, ±20cm, ±20°)
-Stage 3: 180° Turn (0.3-0.6m, 180° yaw)
-Stage 4: Arena Search (0.8-1.5m, random yaw)
-Stage 5: Full Autonomy (random position, random yaw)
-
-Auto-advances at 80% success rate
+TEKO - 12-STAGE ULTRA-GRADUAL CURRICULUM TRAINING
+==================================================
+2,000,000 steps total
+15k minimum steps per stage before checking advancement
+85% success rate threshold
+Fixed curriculum advancement bug
 """
 
 import argparse
@@ -21,7 +17,7 @@ from isaaclab.app import AppLauncher
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--num_envs", type=int, default=16, help="Parallel environments")
-parser.add_argument("--steps", type=int, default=500000, help="Total training steps")
+parser.add_argument("--steps", type=int, default=2000000, help="Total training steps")
 parser.add_argument("--seed", type=int, default=42, help="Random seed")
 parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
 parser.add_argument("--rollout_len", type=int, default=64, help="Rollout length")
@@ -45,9 +41,6 @@ from teko.tasks.direct.teko.teko_brain.cnn_model import create_visual_encoder
 from teko.tasks.direct.teko.curriculum.curriculum_manager import should_advance_curriculum, STAGE_NAMES
 
 
-# ============================================================================
-# PPO Policy Network
-# ============================================================================
 class Policy(nn.Module):
     def __init__(self):
         super().__init__()
@@ -148,10 +141,12 @@ def ppo_update(policy, optimizer, obs, actions, logp_old, advantages, returns,
 
 def main():
     print("\n" + "="*70)
-    print("🎓 TEKO - 6-STAGE CURRICULUM TRAINING")
+    print("🎓 TEKO - 12-STAGE ULTRA-GRADUAL CURRICULUM")
     print("="*70)
-    print(f"Envs: {args.num_envs} | Steps: {args.steps:,} | LR: {args.lr}")
-    print("Stages: 6 | Advance at: 80% success")
+    print(f"Environments: {args.num_envs}")
+    print(f"Total steps: {args.steps:,}")
+    print(f"Stages: 12 (ultra-gradual)")
+    print(f"Advancement: 85% success, min 15k steps/stage")
     print("="*70 + "\n")
     
     torch.manual_seed(args.seed)
@@ -172,7 +167,6 @@ def main():
     print(f"✓ Policy: {sum(p.numel() for p in policy.parameters()):,} params")
     print(f"📊 TensorBoard: tensorboard --logdir teko_curriculum")
     print(f"💾 Checkpoints: {log_dir}\n")
-    print(f"[CURRICULUM] {STAGE_NAMES[0]}\n")
     
     obs_dict, _ = env.reset()
     obs = obs_dict["rgb"]
@@ -186,8 +180,9 @@ def main():
     current_episode_length = torch.zeros(args.num_envs, dtype=torch.int32, device=device)
     
     step = 0
-    steps_in_stage = 0
-    next_stage_check = 10000
+    steps_in_current_stage = 0  # FIXED: Track steps in CURRENT stage
+    
+    print(f"[CURRICULUM] {STAGE_NAMES[0]}\n")
     
     while step < args.steps:
         obs_buf, act_buf, rew_buf, val_buf, logp_buf, done_buf = [], [], [], [], [], []
@@ -222,7 +217,7 @@ def main():
             
             obs = next_obs
             step += args.num_envs
-            steps_in_stage += args.num_envs
+            steps_in_current_stage += args.num_envs  # FIXED: increment per-stage counter
         
         obs_t = torch.stack(obs_buf)
         act_t = torch.stack(act_buf)
@@ -251,30 +246,29 @@ def main():
         writer.add_scalar("train/curriculum_stage", env.curriculum_level, step)
         writer.add_scalar("train/policy_loss", policy_loss, step)
         writer.add_scalar("train/value_loss", value_loss, step)
+        writer.add_scalar("train/steps_in_stage", steps_in_current_stage, step)
         
-        print(f"[{step:7d}] Stage{env.curriculum_level} | R={mean_reward:6.1f} | "
-              f"Len={mean_length:4.0f} | Success={success_rate*100:4.1f}% | "
-              f"Stage_SR={stage_success*100:4.1f}%")
-
-        # Curriculum advancement: after enough env-steps in this stage
-        if steps_in_stage >= next_stage_check:
+        print(f"[{step:7d}] S{env.curriculum_level:02d} | R={mean_reward:6.1f} | "
+              f"Len={mean_length:4.0f} | SR={success_rate*100:4.1f}% | "
+              f"SSR={stage_success*100:4.1f}% | StageSteps={steps_in_current_stage:5d}")
+        
+        # FIXED: Check advancement only after minimum steps in THIS stage
+        if steps_in_current_stage >= 15000:  # Minimum 15k steps per stage
             if should_advance_curriculum(stage_success, env.curriculum_level):
                 env.set_curriculum_level(env.curriculum_level + 1)
                 stage_success_window.clear()
-                steps_in_stage = 0
-                next_stage_check = 10000   # require 10k steps in each new stage
-
-                print(f"\n{'='*70}")
-                print(f"🎓 ADVANCED! {STAGE_NAMES[env.curriculum_level]}")
-                print(f"{'='*70}\n")
+                steps_in_current_stage = 0  # FIXED: Reset counter when advancing
         
-        if step % 10000 == 0 and step > 0:
+        # Checkpoint every 50k steps
+        if step % 50000 == 0 and step > 0:
             torch.save({
                 'policy': policy.state_dict(),
                 'optimizer': optimizer.state_dict(),
                 'step': step,
                 'curriculum_level': env.curriculum_level,
+                'steps_in_stage': steps_in_current_stage,
             }, f"{log_dir}/ckpt_{step}.pt")
+            print(f"💾 Checkpoint: ckpt_{step}.pt")
     
     torch.save({
         'policy': policy.state_dict(),
@@ -284,7 +278,8 @@ def main():
     }, f"{log_dir}/final.pt")
     
     print(f"\n{'='*70}")
-    print(f"✅ TRAINING COMPLETE! Final: {STAGE_NAMES[env.curriculum_level]}")
+    print(f"✅ TRAINING COMPLETE!")
+    print(f"Final stage: {STAGE_NAMES[env.curriculum_level]}")
     print(f"💾 Model: {log_dir}/final.pt")
     print(f"{'='*70}\n")
     
@@ -297,5 +292,5 @@ if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        print("\n⚠️ Interrupted")
+        print("\n⚠️ Training interrupted")
         sim.close()
