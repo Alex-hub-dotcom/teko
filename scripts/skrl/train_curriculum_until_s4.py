@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-TEKO - 16-STAGE ULTRA-GRADUAL CURRICULUM TRAINING
+TEKO - 12-STAGE ULTRA-GRADUAL CURRICULUM TRAINING
 ==================================================
-3,000,000 steps total
+2,000,000 steps total
 15k minimum steps per stage before checking advancement
 85% success rate threshold
 Fixed curriculum advancement bug
@@ -22,8 +22,6 @@ parser.add_argument("--seed", type=int, default=42, help="Random seed")
 parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
 parser.add_argument("--rollout_len", type=int, default=64, help="Rollout length")
 parser.add_argument("--epochs", type=int, default=8, help="PPO epochs per update")
-parser.add_argument("--checkpoint", type=str, default=None,
-                    help="Path to checkpoint (.pt) to resume from")
 parser.add_argument("--batch_size", type=int, default=256, help="Minibatch size")
 AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
@@ -40,11 +38,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from teko.tasks.direct.teko.teko_env import TekoEnv, TekoEnvCfg
 from teko.tasks.direct.teko.teko_brain.cnn_model import create_visual_encoder
-from teko.tasks.direct.teko.curriculum.curriculum_manager import (
-    should_advance_curriculum, 
-    STAGE_NAMES, 
-    set_curriculum_level,
-)
+from teko.tasks.direct.teko.curriculum.curriculum_manager import should_advance_curriculum, STAGE_NAMES
 
 
 class Policy(nn.Module):
@@ -147,20 +141,17 @@ def ppo_update(policy, optimizer, obs, actions, logp_old, advantages, returns,
 
 def main():
     print("\n" + "="*70)
-    print("🎓 TEKO - 16-STAGE ULTRA-GRADUAL CURRICULUM")
+    print("🎓 TEKO - 12-STAGE ULTRA-GRADUAL CURRICULUM")
     print("="*70)
     print(f"Environments: {args.num_envs}")
     print(f"Total steps: {args.steps:,}")
-    print(f"Stages: {len(STAGE_NAMES)} (ultra-gradual)")
+    print(f"Stages: 12 (ultra-gradual)")
     print(f"Advancement: 85% success, min 15k steps/stage")
     print("="*70 + "\n")
     
     torch.manual_seed(args.seed)
     device = torch.device("cuda:0")
     
-    # ------------------------------------------------------------------
-    # Environment + Policy
-    # ------------------------------------------------------------------
     cfg = TekoEnvCfg()
     cfg.scene.num_envs = args.num_envs
     cfg.enable_curriculum = True
@@ -169,25 +160,6 @@ def main():
     policy = Policy().to(device)
     optimizer = torch.optim.Adam(policy.parameters(), lr=args.lr)
     
-    # ------------------------------------------------------------------
-    # Optional checkpoint loading (resume training)
-    # ------------------------------------------------------------------
-    start_step = 0
-    steps_in_current_stage = 0
-
-    if args.checkpoint is not None:
-        print(f"🔁 Loading checkpoint from {args.checkpoint}")
-        ckpt = torch.load(args.checkpoint, map_location=device)
-        policy.load_state_dict(ckpt["policy"])
-        optimizer.load_state_dict(ckpt["optimizer"])
-        start_step = ckpt.get("step", 0)
-        env.curriculum_level = ckpt.get("curriculum_level", 0)
-        steps_in_current_stage = ckpt.get("steps_in_stage", 0)
-        print(f"Resumed from step {start_step}, stage {env.curriculum_level}")
-    
-    # ------------------------------------------------------------------
-    # Logging setup
-    # ------------------------------------------------------------------
     log_dir = f"teko_curriculum/{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     os.makedirs(log_dir, exist_ok=True)
     writer = SummaryWriter(log_dir)
@@ -196,9 +168,8 @@ def main():
     print(f"📊 TensorBoard: tensorboard --logdir teko_curriculum")
     print(f"💾 Checkpoints: {log_dir}\n")
     
-    # Initial reset (uses current env.curriculum_level)
     obs_dict, _ = env.reset()
-    obs = obs_dict["rgb"].to(device)
+    obs = obs_dict["rgb"]
     
     episode_rewards = deque(maxlen=100)
     episode_lengths = deque(maxlen=100)
@@ -208,9 +179,10 @@ def main():
     current_episode_reward = torch.zeros(args.num_envs, device=device)
     current_episode_length = torch.zeros(args.num_envs, dtype=torch.int32, device=device)
     
-    step = start_step  # continue from checkpoint step if resuming
+    step = 0
+    steps_in_current_stage = 0  # FIXED: Track steps in CURRENT stage
     
-    print(f"[CURRICULUM] {STAGE_NAMES[env.curriculum_level]}\n")
+    print(f"[CURRICULUM] {STAGE_NAMES[0]}\n")
     
     while step < args.steps:
         obs_buf, act_buf, rew_buf, val_buf, logp_buf, done_buf = [], [], [], [], [], []
@@ -220,7 +192,7 @@ def main():
                 action, logp, value = policy.act(obs)
             
             obs_dict, reward, term, trunc, info = env.step(action)
-            next_obs = obs_dict["rgb"].to(device)
+            next_obs = obs_dict["rgb"]
             done = term | trunc
             
             current_episode_reward += reward
@@ -245,7 +217,7 @@ def main():
             
             obs = next_obs
             step += args.num_envs
-            steps_in_current_stage += args.num_envs  # track per-stage steps
+            steps_in_current_stage += args.num_envs  # FIXED: increment per-stage counter
         
         obs_t = torch.stack(obs_buf)
         act_t = torch.stack(act_buf)
@@ -267,28 +239,28 @@ def main():
         success_rate = np.mean(episode_successes) if episode_successes else 0
         stage_success = np.mean(stage_success_window) if stage_success_window else 0
         
-        writer.add_scalar("train/reward",           mean_reward,   step)
-        writer.add_scalar("train/episode_length",   mean_length,   step)
-        writer.add_scalar("train/success_rate",     success_rate,  step)
-        writer.add_scalar("train/stage_success",    stage_success, step)
+        writer.add_scalar("train/reward", mean_reward, step)
+        writer.add_scalar("train/episode_length", mean_length, step)
+        writer.add_scalar("train/success_rate", success_rate, step)
+        writer.add_scalar("train/stage_success", stage_success, step)
         writer.add_scalar("train/curriculum_stage", env.curriculum_level, step)
-        writer.add_scalar("train/policy_loss",      policy_loss,   step)
-        writer.add_scalar("train/value_loss",       value_loss,    step)
-        writer.add_scalar("train/steps_in_stage",   steps_in_current_stage, step)
+        writer.add_scalar("train/policy_loss", policy_loss, step)
+        writer.add_scalar("train/value_loss", value_loss, step)
+        writer.add_scalar("train/steps_in_stage", steps_in_current_stage, step)
         
         print(f"[{step:7d}] S{env.curriculum_level:02d} | R={mean_reward:6.1f} | "
               f"Len={mean_length:4.0f} | SR={success_rate*100:4.1f}% | "
               f"SSR={stage_success*100:4.1f}% | StageSteps={steps_in_current_stage:5d}")
         
-        # Curriculum advancement: only after enough steps in THIS stage
+        # FIXED: Check advancement only after minimum steps in THIS stage
         if steps_in_current_stage >= 15000:  # Minimum 15k steps per stage
             if should_advance_curriculum(stage_success, env.curriculum_level):
-                set_curriculum_level(env, env.curriculum_level + 1)
+                env.set_curriculum_level(env.curriculum_level + 1)
                 stage_success_window.clear()
-                steps_in_current_stage = 0  # reset counter on stage change
+                steps_in_current_stage = 0  # FIXED: Reset counter when advancing
         
         # Checkpoint every 50k steps
-        if step % 50000 == 0 and step > start_step:
+        if step % 50000 == 0 and step > 0:
             torch.save({
                 'policy': policy.state_dict(),
                 'optimizer': optimizer.state_dict(),
@@ -298,13 +270,11 @@ def main():
             }, f"{log_dir}/ckpt_{step}.pt")
             print(f"💾 Checkpoint: ckpt_{step}.pt")
     
-    # Final save
     torch.save({
         'policy': policy.state_dict(),
         'optimizer': optimizer.state_dict(),
         'step': step,
         'curriculum_level': env.curriculum_level,
-        'steps_in_stage': steps_in_current_stage,
     }, f"{log_dir}/final.pt")
     
     print(f"\n{'='*70}")
