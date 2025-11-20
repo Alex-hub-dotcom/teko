@@ -29,7 +29,7 @@ class TekoEnvCfg(DirectRLEnvCfg):
     # General parameters
     # ------------------------------------------------------------------
     decimation = 2
-    episode_length_s = 15.0  # SHORTER: 15 seconds instead of 30
+    episode_length_s = 15.0  # shorter episodes: 15 seconds instead of 30
     enable_curriculum = False 
     
     # ------------------------------------------------------------------
@@ -119,7 +119,8 @@ class TekoEnvCfg(DirectRLEnvCfg):
     # ------------------------------------------------------------------
     # Observation and action spaces
     # ------------------------------------------------------------------
-    action_space = (2,)  # [left, right] torque control inputs
+    # Action space is 2D: [v, w] = [forward/back, turn], each in [-1, 1].
+    action_space = (2,)
     observation_space = {
         "rgb": (3, 480, 640),
     }
@@ -127,7 +128,11 @@ class TekoEnvCfg(DirectRLEnvCfg):
     # ------------------------------------------------------------------
     # Notes
     # ------------------------------------------------------------------
-    # Actions in [-1, 1] are scaled by max_wheel_torque:
-    #   [1.0, 1.0]  → +3.0 Nm forward (faster than before)
-    #   [-1.0, -1.0] → -3.0 Nm reverse
-    #   [1.0, -1.0] → rotate in place
+    # Actions in [-1, 1] are interpreted as:
+    #   v = actions[0] → forward/backward command
+    #   w = actions[1] → turning command
+    #
+    # Inside the environment, these are mapped to wheel torques with:
+    #   left  = v - k * w
+    #   right = v + k * w
+    # and then scaled by max_wheel_torque.

@@ -37,7 +37,7 @@ class DockingCNN(nn.Module):
         self.projection = nn.Sequential(
             nn.Linear(mobilenet_out_dim, feature_dim),
             nn.ReLU(inplace=True),
-            nn.Dropout(0.2)
+            nn.Dropout(0.2) ##################################################################################################################
         )
 
         self.feature_dim = feature_dim

@@ -6,6 +6,12 @@ TEKO Environment - 12-Stage Curriculum Compatible
 - Nuclear penalties (-500 collision/boundary)
 - Survival bonus (+0.3/step)
 - Anti-crash exploit (min_collision_steps=10)
+
+This environment was created for the TEKO vision-based docking project.
+
+Author: Alexandre Schleier Neves da Silva
+For questions or collaboration, feel free to contact:
+    alexandre.schleiernevesdasilva@uni-hohenheim.de
 """
 
 from __future__ import annotations
@@ -27,29 +33,44 @@ from .robots.teko_static import TEKOStatic
 
 
 class TekoEnv(DirectRLEnv):
-    """Torque-driven TEKO environment with 12-stage curriculum."""
+    """
+    Torque-driven TEKO environment with curriculum.
+
+    This class connects:
+    - the TEKO robot model,
+    - the static goal robot,
+    - the RGB camera,
+    - and the reward / curriculum logic
+    into a reinforcement learning environment.
+    """
 
     cfg: TekoEnvCfg
 
     def __init__(self, cfg: TekoEnvCfg, render_mode: str | None = None, **kwargs):
+        # Camera resolution (used for observation tensor shape)
         self._cam_res = (cfg.camera.width, cfg.camera.height)
+
+        # Torque scaling for the wheels
         self._max_wheel_torque = cfg.max_wheel_torque
+
+        # These will be initialized later
         self.actions = None
         self.dof_idx = None
         self.cameras = []
         self.goal_positions = None
         self.num_agents = 1
+        self._polarity = None  # wheel direction (left/right) will be cached here
 
         # Curriculum learning (12 stages: 0-11)
         self.curriculum_level = 0
 
-        # State tracking
+        # State tracking (used by reward functions)
         self.prev_robot_pos = None
         self.prev_distance = None
         self.prev_actions = None
         self.step_count = None
 
-        # Episode statistics
+        # Episode statistics (for logging and analysis)
         self.episode_rewards = []
         self.episode_lengths = []
         self.episode_successes = []
@@ -59,6 +80,7 @@ class TekoEnv(DirectRLEnv):
             "collision_penalty": [], "wall_penalty": []
         }
 
+        # Call Isaac Lab base class constructor
         super().__init__(cfg, render_mode, **kwargs)
 
     # ------------------------------------------------------------------
@@ -69,18 +91,28 @@ class TekoEnv(DirectRLEnv):
         if stage is None:
             raise RuntimeError("USD stage not initialized")
 
+        # Root Xform for the first environment (others will be cloned)
         if not stage.GetPrimAtPath("/World/envs/env_0"):
             stage.DefinePrim("/World/envs/env_0", "Xform")
 
         self._setup_global_lighting(stage)
+
+        # Active robot (articulation)
         self.robot = Articulation(self.cfg.robot_cfg)
         self.scene.articulations["robot"] = self.robot
+
+        # Clone environments (env_1, env_2, ...) from env_0
         self.scene.clone_environments(copy_from_source=True)
+
+        # Arena, static robot, etc.
         self._setup_per_environment_assets(stage)
+
+        # Cameras and goal positions
         self._setup_cameras()
         self._cache_goal_transforms()
 
     def _init_observation_space(self):
+        """Define the observation space (here: only RGB images)."""
         import gymnasium as gym
         frame_shape = (3, self.cfg.camera.height, self.cfg.camera.width)
         self.observation_space = gym.spaces.Dict({
@@ -94,6 +126,7 @@ class TekoEnv(DirectRLEnv):
         print(f"[INFO] Observation space set to {frame_shape}, range [0, 1]")
 
     def _setup_global_lighting(self, stage):
+        """Simple dome + sun lighting to make the scene visible on camera."""
         if stage.GetPrimAtPath("/World/DomeLight"):
             stage.RemovePrim("/World/DomeLight")
 
@@ -109,6 +142,12 @@ class TekoEnv(DirectRLEnv):
         print("[INFO] Global lighting setup complete.")
 
     def _setup_per_environment_assets(self, stage):
+        """
+        For each environment (env_0, env_1, ...) we:
+        - add the arena,
+        - position the active robot,
+        - spawn the static docking target with ArUco marker.
+        """
         num_envs = self.scene.cfg.num_envs
         ARENA_USD_PATH = "/workspace/teko/documents/CAD/USD/stage_arena.usd"
         ARUCO_IMG_PATH = "/workspace/teko/documents/Aruco/test_marker.png"
@@ -116,13 +155,14 @@ class TekoEnv(DirectRLEnv):
         for env_idx in range(num_envs):
             env_path = f"/World/envs/env_{env_idx}"
 
+            # Arena
             try:
                 arena_prim = stage.DefinePrim(f"{env_path}/Arena", "Xform")
                 arena_prim.GetReferences().AddReference(ARENA_USD_PATH)
             except Exception as e:
                 print(f"[WARN] Arena failed for env_{env_idx}: {e}")
 
-            # Active robot start position
+            # Active robot start pose (approximate)
             robot_prim = stage.GetPrimAtPath(f"{env_path}/Robot")
             if robot_prim.IsValid():
                 xf_robot = UsdGeom.Xformable(robot_prim)
@@ -143,7 +183,7 @@ class TekoEnv(DirectRLEnv):
         print(f"[INFO] Created {num_envs} environments.")
 
     def _setup_cameras(self):
-        """Setup cameras using Isaac Lab's Camera sensor."""
+        """Attach one RGB camera to the back of the active robot in each env."""
         for env_idx in range(self.scene.cfg.num_envs):
             cam_path = (
                 f"/World/envs/env_{env_idx}/Robot/teko_urdf/TEKO_Body/"
@@ -165,9 +205,14 @@ class TekoEnv(DirectRLEnv):
         print(f"[INFO] Initialized {len(self.cameras)} cameras.")
 
     def _cache_goal_transforms(self):
+        """
+        Precompute the global positions of the docking target
+        for each environment. Used by reward and reset code.
+        """
         num_envs = self.scene.cfg.num_envs
         self.goal_positions = torch.zeros((num_envs, 3), device=self.device)
         for env_idx, origin in enumerate(self.scene.env_origins):
+            # The goal is always 1 m in +x and 0.40 m high in local env frame
             local_goal = torch.tensor([1.0, 0.0, 0.40], device=self.device)
             self.goal_positions[env_idx] = origin + local_goal
         print(f"[INFO] Cached {num_envs} goal positions.")
@@ -176,7 +221,12 @@ class TekoEnv(DirectRLEnv):
     # Sphere position computation (docking measurement)
     # ------------------------------------------------------------------
     def get_sphere_distances_from_physics(self):
-        """Get sphere distances for docking measurement."""
+        """
+        Compute the distance between the male/female connector spheres.
+
+        We use these spheres instead of chassis distance because
+        they represent the actual docking interface.
+        """
         FEMALE_OFFSET = torch.tensor([0.24, 0.0, -0.08], device=self.device)
         MALE_OFFSET = torch.tensor([0.22667, -0.00144, -0.08815], device=self.device)
 
@@ -192,6 +242,7 @@ class TekoEnv(DirectRLEnv):
         
         R_FEMALE = 0.005
         R_MALE = 0.005
+        # Surface distance = distance between sphere surfaces (0 means touching)
         surface_3d = torch.clamp(dist_3d - (R_FEMALE + R_MALE), min=0.0)
         surface_xy = torch.clamp(dist_xy - (R_FEMALE + R_MALE), min=0.0)
         
@@ -201,8 +252,16 @@ class TekoEnv(DirectRLEnv):
     # Actions (Torque control)
     # ------------------------------------------------------------------
     def _lazy_init_articulation(self):
+        """
+        Initialize joint indices once we know the robot is fully loaded.
+
+        This looks up the wheel joint indices by name and also creates
+        a polarity tensor to handle left/right sign differences.
+        """
         if self.dof_idx is not None or getattr(self.robot, "root_physx_view", None) is None:
             return
+
+        # Map joint names -> indices
         name_to_idx = {n: i for i, n in enumerate(self.robot.joint_names)}
         indices = [name_to_idx[n] for n in self.cfg.dof_names if n in name_to_idx]
         if not indices:
@@ -210,27 +269,74 @@ class TekoEnv(DirectRLEnv):
         self.dof_idx = torch.tensor(indices, dtype=torch.long, device=self.device)
         print(f"[INFO] DOF indices: {self.dof_idx}")
 
+        # Cache wheel polarity tensor on the correct device (only once)
+        if self._polarity is None:
+            self._polarity = torch.tensor(
+                self.cfg.wheel_polarity, device=self.device
+            ).unsqueeze(0)
+
     def _pre_physics_step(self, actions: torch.Tensor):
+        # Store actions for this step and ensure articulation is initialized
         self.actions = actions
         self._lazy_init_articulation()
 
     def _apply_action(self):
+        """
+        Convert RL actions into wheel torques.
+
+        Action space: [v_cmd, w_cmd] in [-1, 1]
+          v_cmd -> forward/backward command
+          w_cmd -> turning command
+
+        These are mapped to left/right wheel torques using a simple
+        differential-drive model (v ± k * w).
+        """
         if self.dof_idx is None or self.actions is None:
             return
+
         num_envs = self.scene.cfg.num_envs
+
+        # actions in [-1, 1]: [v_cmd, w_cmd]
+        v_cmd = self.actions[:, 0]  # forward/back command
+        w_cmd = self.actions[:, 1]  # turn command
+
+        # Scaling factors for linear and angular commands
+        v_max = 1.0  # can be tuned
+        w_max = 1.0  # can be tuned
+
+        v = v_cmd * v_max
+        w = w_cmd * w_max
+
+        # Differential-drive mapping: left/right from linear + angular components
+        k = 0.5  # turning gain, can be tuned
+        left  = v - k * w
+        right = v + k * w
+
+        # Clamp before torque scaling so we stay in [-1, 1]
+        left  = torch.clamp(left,  -1.0, 1.0)
+        right = torch.clamp(right, -1.0, 1.0)
+
+        # [FL, FR, BL, BR] torques (before polarity)
         torque_targets = torch.stack(
-            [self.actions[:, 0], self.actions[:, 1], self.actions[:, 0], self.actions[:, 1]], dim=1
+            [left, right, left, right], dim=1
         ) * self._max_wheel_torque
-        polarity = torch.tensor(self.cfg.wheel_polarity, device=self.device).unsqueeze(0)
-        torque_targets = torque_targets * polarity
+
+        # Apply wheel polarity (handles opposite rotation directions)
+        torque_targets = torque_targets * self._polarity
+
         env_ids = torch.arange(num_envs, device=self.device)
-        self.robot.set_joint_effort_target(torque_targets, env_ids=env_ids, joint_ids=self.dof_idx)
+        self.robot.set_joint_effort_target(
+            torque_targets, env_ids=env_ids, joint_ids=self.dof_idx
+        )
 
     # ------------------------------------------------------------------
     # Observations
     # ------------------------------------------------------------------
     def _get_observations(self) -> dict:
-        """Get RGB observations from cameras."""
+        """
+        Capture RGB images from each camera and stack them into
+        a tensor of shape [num_envs, 3, H, W] in [0, 1].
+        """
         import torch.nn.functional as F
         num_envs = self.scene.cfg.num_envs
         h, w = self._cam_res[1], self._cam_res[0]
@@ -241,16 +347,25 @@ class TekoEnv(DirectRLEnv):
             
             rgb_data = cam.data.output["rgb"]
             if rgb_data is not None and rgb_data.numel() > 0:
+                # Isaac Lab sometimes returns [1, H, W, C]
                 if rgb_data.ndim == 4:
                     rgb_data = rgb_data.squeeze(0)
                 
+                # Drop alpha channel if present (RGBA -> RGB)
                 if rgb_data.shape[-1] == 4:
                     rgb_data = rgb_data[..., :3]
                 
+                # Convert to [C, H, W] and normalize to [0, 1]
                 rgb = rgb_data.permute(2, 0, 1).float() / 255.0
                 
+                # Make sure resolution is exactly (H, W)
                 if rgb.shape[1] != h or rgb.shape[2] != w:
-                    rgb = F.interpolate(rgb.unsqueeze(0), size=(h, w), mode="bilinear", align_corners=False).squeeze(0)
+                    rgb = F.interpolate(
+                        rgb.unsqueeze(0),
+                        size=(h, w),
+                        mode="bilinear",
+                        align_corners=False
+                    ).squeeze(0)
                 
                 rgb_obs[env_idx] = rgb
 
@@ -260,23 +375,32 @@ class TekoEnv(DirectRLEnv):
     # Rewards
     # ------------------------------------------------------------------
     def _get_rewards(self):
+        """Delegate reward computation to an external function."""
         return compute_total_reward(self)
 
     # ------------------------------------------------------------------
     # Dones (NUCLEAR PENALTIES: -500)
     # ------------------------------------------------------------------
     def _get_dones(self):
-        """Terminate when: success, out of bounds, collision, OR timeout."""
+        """
+        Episode termination logic.
+
+        Episode ends when:
+        - docking success is achieved,
+        - robot leaves the allowed arena (out of bounds),
+        - a high-speed collision near the goal occurs,
+        - or the max episode length is reached.
+        """
         _, _, surface_xy, _ = self.get_sphere_distances_from_physics()
 
         # Anti-exploit gates
         min_success_steps = 5
-        min_collision_steps = 10  # ANTI-CRASH EXPLOIT
+        min_collision_steps = 10  # helps avoid "crash immediately for reward"
 
-        # Raw geometric success
+        # Raw geometric success (within 3 cm of connector)
         raw_success = surface_xy < 0.03
 
-        # Only count success as terminal after min steps
+        # Only count success as terminal after a few steps
         success = raw_success & (self.episode_length_buf >= min_success_steps)
 
         # OUT OF BOUNDS (-500 penalty in rewards)
@@ -308,9 +432,16 @@ class TekoEnv(DirectRLEnv):
         return terminated, time_out
 
     # ------------------------------------------------------------------
-    # Reset (USES 12-STAGE CURRICULUM)
+    # Reset (USES CURRICULUM)
     # ------------------------------------------------------------------
     def _reset_idx(self, env_ids):
+        """
+        Reset a subset of environments.
+
+        This calls the curriculum reset function, which places
+        the active robot at a position/orientation depending on
+        the current curriculum stage.
+        """
         super()._reset_idx(env_ids)
         self._lazy_init_articulation()
 
@@ -327,10 +458,10 @@ class TekoEnv(DirectRLEnv):
         self.prev_actions[env_ids] = 0.0
         self.step_count[env_ids] = 0
 
-        # Spawn according to 12-STAGE curriculum
+        # Curriculum-based spawn (different stages = different initial poses)
         reset_environment_curriculum(self, env_ids)
 
-        # Recompute initial distance for progress reward
+        # Recompute initial distance for progress-based reward terms
         _, _, surface_xy, _ = self.get_sphere_distances_from_physics()
         self.prev_distance[env_ids] = surface_xy[env_ids]
 
@@ -339,4 +470,5 @@ class TekoEnv(DirectRLEnv):
         set_curriculum_level(self, level)
 
     def get_episode_statistics(self):
+        """Collect statistics (mean reward, success rate, etc.)."""
         return collect_episode_stats(self)

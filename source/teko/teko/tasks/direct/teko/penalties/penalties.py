@@ -6,6 +6,11 @@
 # All penalties are computed directly in reward_functions.py
 # This file is kept for reference/future modularization
 
+
+# NOTE: This module is currently NOT used by the TEKO environment.
+# All active penalties live in rewards/reward_functions.py.
+# Kept only for reference / future refactoring.
+
 import torch
 
 
