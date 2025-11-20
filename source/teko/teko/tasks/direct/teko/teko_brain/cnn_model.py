@@ -2,8 +2,12 @@
 CNN Feature Extractor for TEKO Docking
 --------------------------------------
 Provides two encoders:
-- DockingCNN: MobileNetV3-Small (pretrained, efficient)
-- SimpleCNN: Lightweight CNN for faster training
+- DockingCNN: MobileNetV3-Small (optionally ImageNet-pretrained)
+- SimpleCNN: Lightweight CNN for faster training or ablations.
+
+Author: Alexandre Schleier Neves da Silva
+If you have questions or need support, contact:
+  alexandre.schleiernevesdasilva@uni-hohenheim.de
 """
 
 import torch
@@ -17,27 +21,29 @@ import torchvision.models as models
 class DockingCNN(nn.Module):
     """
     Visual feature extractor for robot docking.
-    Uses pretrained MobileNetV3-Small for efficiency.
+    Uses MobileNetV3-Small as a backbone, optionally with ImageNet pretraining.
     """
     def __init__(self, feature_dim: int = 256, pretrained: bool = True):
         """
         Args:
-            feature_dim: Output feature dimension
-            pretrained: Use ImageNet pretrained weights
+            feature_dim: Output feature dimension passed to the policy.
+            pretrained:  If True, load ImageNet-pretrained weights.
         """
         super().__init__()
+
+        # Load MobileNetV3-Small
         mobilenet = models.mobilenet_v3_small(pretrained=pretrained)
 
-        # Feature extractor (remove classifier)
+        # Use only the feature extractor part (no classifier head)
         self.features = mobilenet.features
         self.avgpool = mobilenet.avgpool
-        mobilenet_out_dim = 576  # MobileNetV3-small output channels
+        mobilenet_out_dim = 576  # MobileNetV3-Small output channels
 
-        # Projection head
+        # Projection head: compress backbone features to feature_dim
         self.projection = nn.Sequential(
             nn.Linear(mobilenet_out_dim, feature_dim),
             nn.ReLU(inplace=True),
-            nn.Dropout(0.2) ##################################################################################################################
+            # No dropout here: we keep the encoder deterministic for RL.
         )
 
         self.feature_dim = feature_dim
@@ -45,20 +51,24 @@ class DockingCNN(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Extract visual features from RGB images.
+
         Args:
-            x: RGB tensor [B, 3, H, W] in [0, 1]
+            x: RGB tensor [B, 3, H, W] with values in [0, 1].
+
         Returns:
             features: [B, feature_dim]
         """
-        # Normalize (ImageNet stats)
+        # Normalize with ImageNet statistics (what MobileNet expects)
         mean = torch.tensor([0.485, 0.456, 0.406], device=x.device).view(1, 3, 1, 1)
         std = torch.tensor([0.229, 0.224, 0.225], device=x.device).view(1, 3, 1, 1)
         x = (x - mean) / std
 
-        # Extract features
+        # Backbone + global pooling
         x = self.features(x)
         x = self.avgpool(x)
         x = torch.flatten(x, 1)
+
+        # Projection to feature_dim
         return self.projection(x)
 
 
@@ -67,8 +77,8 @@ class DockingCNN(nn.Module):
 # ================================================================
 class SimpleCNN(nn.Module):
     """
-    Lightweight CNN alternative if MobileNet is too heavy.
-    Useful for faster prototyping or resource-constrained scenarios.
+    Lightweight CNN alternative if MobileNet is too heavy or for ablation studies.
+    This model is always trained from scratch.
     """
     def __init__(self, feature_dim: int = 256):
         super().__init__()
@@ -97,14 +107,14 @@ class SimpleCNN(nn.Module):
         self.fc = nn.Sequential(
             nn.Linear(n_flat, 512),
             nn.ReLU(inplace=True),
-            nn.Dropout(0.2),
+            # No dropout: keep behaviour deterministic for RL.
             nn.Linear(512, feature_dim),
-            nn.ReLU(inplace=True)
+            nn.ReLU(inplace=True),
         )
 
         self.feature_dim = feature_dim
 
-        # --- Initialize weights ---
+        # --- Initialize weights (good practice for custom CNNs) ---
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
                 nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
@@ -112,14 +122,16 @@ class SimpleCNN(nn.Module):
                 nn.init.xavier_uniform_(m.weight)
                 nn.init.constant_(m.bias, 0)
 
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            x: RGB images [B, 3, H, W], values in [0, 1]
+            x: RGB images [B, 3, H, W], values in [0, 1].
+
         Returns:
             features: [B, feature_dim]
         """
-        # Normalize inputs (same as MobileNet)
+        # Use the same normalization as MobileNet for consistency
         mean = torch.tensor([0.485, 0.456, 0.406], device=x.device).view(1, 3, 1, 1)
         std = torch.tensor([0.229, 0.224, 0.225], device=x.device).view(1, 3, 1, 1)
         x = (x - mean) / std
@@ -135,14 +147,18 @@ class SimpleCNN(nn.Module):
 def create_visual_encoder(
     architecture: str = "mobilenet",
     feature_dim: int = 256,
-    pretrained: bool = True
+    pretrained: bool = True,
 ) -> nn.Module:
     """
-    Create a visual encoder.
+    Create a visual encoder for the TEKO docking task.
+
     Args:
-        architecture: "mobilenet" or "simple"
-        feature_dim: output feature dimension
-        pretrained: whether to use pretrained weights (for mobilenet)
+        architecture: "mobilenet" (ImageNet-pretrained backbone) or "simple".
+        feature_dim:  Output feature dimension for the RL policy.
+        pretrained:   Only used for "mobilenet". If True, load ImageNet weights.
+
+    Returns:
+        nn.Module: encoder instance (DockingCNN or SimpleCNN)
     """
     if architecture == "mobilenet":
         return DockingCNN(feature_dim=feature_dim, pretrained=pretrained)
