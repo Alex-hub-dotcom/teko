@@ -1,46 +1,55 @@
+#!/usr/bin/env python3
 # SPDX-License-Identifier: BSD-3-Clause
 """
-TEKO Torque Test – Straight Line
-================================
-Drives the TEKO robot forward at constant torque to verify wheel actuation,
-friction, and ground interaction. Compatible with Isaac Lab 0.47.1 and
-the torque-driven TEKO environment.
+TEKO Torque & Motion Sanity Test (v,w)
+======================================
+
+- Uses your TekoEnv and TekoEnvCfg exactly as defined.
+- Action is [v, w] in [-1, 1], where:
+    v = forward/backward command
+    w = turning command
+
+We run several phases:
+    1) idle
+    2) forward
+    3) backward
+    4) left turn (in place)
+    5) right turn (in place)
+    6) idle
+
+If the robot doesn't move or values barely change, torque/control is not
+doing what we expect.
 """
 
-from isaaclab.app import AppLauncher
-import torch
 import time
 import random
+import argparse
+
+import torch
 import numpy as np
-
-# ----------------------------------------------------------------------
-# Parameters
-# ----------------------------------------------------------------------
-FORWARD_TORQUE = 0.5          # Normalized torque command [-1, 1]
-DURATION = 10.0               # Duration in seconds
-STEP_HZ = 60                  # Simulation frequency (Hz)
-HEADLESS = False              # Set True for offscreen/headless run
+from isaaclab.app import AppLauncher
 
 
-def main(headless=HEADLESS):
-    # ------------------------------------------------------------------
-    # 1. Launch Isaac Lab application (with cameras enabled)
-    # ------------------------------------------------------------------
+STEP_HZ = 60  # simulation / control frequency
+
+
+def run_torque_test(headless: bool = False):
+    # --------------------------------------------------------------
+    # 1. Launch Isaac Lab app
+    # --------------------------------------------------------------
     app_launcher = AppLauncher(
         headless=headless,
-        enable_cameras=True,   # IMPORTANT: allow camera sensors to spawn
+        enable_cameras=True,  # fine to keep this on
     )
     app = app_launcher.app
 
-    # ------------------------------------------------------------------
-    # 2. Import environment definitions AFTER app init
-    # ------------------------------------------------------------------
+    # Import AFTER app init
     from teko.tasks.direct.teko.teko_env import TekoEnv
     from teko.tasks.direct.teko.teko_env_cfg import TekoEnvCfg
 
-    # ------------------------------------------------------------------
-    # 3. Initialize deterministic environment
-    # ------------------------------------------------------------------
+    # --------------------------------------------------------------
+    # 2. Deterministic setup
+    # --------------------------------------------------------------
     seed = 1234
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -53,50 +62,67 @@ def main(headless=HEADLESS):
 
     env = TekoEnv(cfg)
     env.reset()
-    print("[INFO] TEKO environment ready (torque test).")
+    device = env.device
 
-    # ------------------------------------------------------------------
-    # 4. Prepare constant torque command
-    # ------------------------------------------------------------------
-    torque_cmd = torch.tensor([[FORWARD_TORQUE, FORWARD_TORQUE]], device=env.device)
-    print(f"[INFO] Applying constant forward torque: {FORWARD_TORQUE:.2f}")
+    print("[INFO] TEKO environment ready (v,w torque/motion test).")
 
-    # ------------------------------------------------------------------
-    # 5. Simulation loop
-    # ------------------------------------------------------------------
-    steps = int(DURATION * STEP_HZ)
-    print(f"[INFO] Running simulation for {steps} steps ({DURATION}s) ...")
+    # --------------------------------------------------------------
+    # 3. Define [v, w] commands
+    # --------------------------------------------------------------
+    # v = forward/backward  in [-1, 1]
+    # w = turn (left/right) in [-1, 1]
 
+    idle_cmd     = torch.tensor([[0.0,  0.0]], device=device)
+    forward_cmd  = torch.tensor([[1.0,  0.0]], device=device)   # forward
+    backward_cmd = torch.tensor([[-1.0, 0.0]], device=device)   # backward
+    left_turn    = torch.tensor([[0.0,  1.0]], device=device)   # rotate left
+    right_turn   = torch.tensor([[0.0, -1.0]], device=device)   # rotate right
+
+    phases = [
+        ("idle_start", idle_cmd,     2.0),
+        ("forward",    forward_cmd,  4.0),
+        ("backward",   backward_cmd, 4.0),
+        ("left_turn",  left_turn,    4.0),
+        ("right_turn", right_turn,   4.0),
+        ("idle_end",   idle_cmd,     2.0),
+    ]
+
+    print("[INFO] Starting motion phases...")
     t0 = time.time()
-    for step in range(steps):
-        env.step(torque_cmd)
-        app.update()
 
-        # Periodic state print (1x per second)
-        if step % STEP_HZ == 0:
-            pos = env.robot.data.root_pos_w[0].cpu().numpy()
-            lin_vel = env.robot.data.root_lin_vel_w[0].cpu().numpy()
-            ang_vel = env.robot.data.root_ang_vel_w[0].cpu().numpy()
-            elapsed = time.time() - t0
-            print(
-                f"[{elapsed:05.2f}s] "
-                f"pos(x={pos[0]:.3f}, y={pos[1]:.3f}, z={pos[2]:.3f}) | "
-                f"lin_vel=({lin_vel[0]:.3f}, {lin_vel[1]:.3f}, {lin_vel[2]:.3f}) | "
-                f"ang_vel=({ang_vel[0]:.3f}, {ang_vel[1]:.3f}, {ang_vel[2]:.3f})"
-            )
+    for phase_name, cmd, duration in phases:
+        n_steps = int(duration * STEP_HZ)
+        print(f"\n[PHASE] {phase_name} – {duration:.1f}s ({n_steps} steps)")
 
-        # Optional: run approximately in real time
-        time.sleep(1.0 / STEP_HZ)
+        for step in range(n_steps):
+            # IMPORTANT: DirectRLEnv.step expects actions with shape [num_envs, 2]
+            env.step(cmd)
+            app.update()
 
-    # ------------------------------------------------------------------
-    # 6. Clean shutdown
-    # ------------------------------------------------------------------
-    print("[INFO] Shutting down simulation.")
+            # Print once per second
+            if step % STEP_HZ == 0:
+                pos = env.robot.data.root_pos_w[0].cpu().numpy()
+                lin_vel = env.robot.data.root_lin_vel_w[0].cpu().numpy()
+                ang_vel = env.robot.data.root_ang_vel_w[0].cpu().numpy()
+                elapsed = time.time() - t0
+
+                print(
+                    f"[{elapsed:05.2f}s] "
+                    f"pos=({pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f}) | "
+                    f"lin_vel=({lin_vel[0]:.3f}, {lin_vel[1]:.3f}, {lin_vel[2]:.3f}) | "
+                    f"ang_vel=({ang_vel[0]:.3f}, {ang_vel[1]:.3f}, {ang_vel[2]:.3f})"
+                )
+
+            # (optional) try to run roughly in real time
+            time.sleep(1.0 / STEP_HZ)
+
+    print("\n[INFO] Torque & motion test finished. Closing app.")
     app.close()
 
 
-# ----------------------------------------------------------------------
-# Entry point
-# ----------------------------------------------------------------------
 if __name__ == "__main__":
-    main(headless=HEADLESS)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--headless", action="store_true", help="Run without GUI")
+    args = parser.parse_args()
+
+    run_torque_test(headless=args.headless)

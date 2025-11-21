@@ -36,8 +36,8 @@ class TekoEnvCfg(DirectRLEnvCfg):
     # Visual debug helpers (used by TekoEnv)
     # - red arena boundaries at |x| = arena_half_x, |y| = arena_half_y
     # - green/red rectangular boxes attached to active & static robots
-    debug_boundaries: bool = True
-    debug_robot_boxes: bool = True
+    debug_boundaries: bool = False
+    debug_robot_boxes: bool = False
 
     # ------------------------------------------------------------------
     # Arena limits (env-local coordinates, meters)
@@ -105,7 +105,7 @@ class TekoEnvCfg(DirectRLEnvCfg):
     # Actuation parameters
     # ------------------------------------------------------------------
     action_scale = 1.0
-    max_wheel_torque = 1.0
+    max_wheel_torque = 1.2
     wheel_polarity = [1.0, -1.0, 1.0, -1.0]  # Left/Right differential polarity
 
     # ------------------------------------------------------------------
