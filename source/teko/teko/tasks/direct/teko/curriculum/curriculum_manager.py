@@ -290,21 +290,37 @@ def _reset_stage14(env, env_ids):
 # Stage 15: Full Autonomy (random in arena)
 def _reset_stage15(env, env_ids):
     """
-    Robot spawns anywhere in a 3 x 5 m area around the goal, random yaw.
-    This approximates a production-like setup.
+    Robot spawns anywhere inside the logical arena, random yaw.
+    This approximates a production-like setup, but always stays
+    within the red boundary walls.
     """
     num = len(env_ids)
+    device = env.device
 
-    # Example: ~3m (X) x ~5m (Y) area around the goal
-    x = env.goal_positions[env_ids, 0] + (torch.rand(num, device=env.device) * 2.6 - 1.3)
-    y = env.goal_positions[env_ids, 1] + (torch.rand(num, device=env.device) * 4.6 - 2.3)
-    z = torch.ones(num, device=env.device) * 0.40
+    # Use the arena half-extents from the env
+    hx = float(env._arena_half_x)
+    hy = float(env._arena_half_y)
 
-    yaw = torch.rand(num, device=env.device) * 2 * np.pi
+    # Small margin so we don't spawn exactly on the walls
+    margin_x = 0.1
+    margin_y = 0.1
+
+    # Sample local (env-frame) positions inside the arena
+    x_local = torch.rand(num, device=device) * (2 * (hx - margin_x)) - (hx - margin_x)
+    y_local = torch.rand(num, device=device) * (2 * (hy - margin_y)) - (hy - margin_y)
+
+    # Convert env-local positions to world using env origins
+    env_origins = env.scene.env_origins[env_ids]      # [N, 3]
+    x = env_origins[:, 0] + x_local
+    y = env_origins[:, 1] + y_local
+    z = torch.ones(num, device=device) * 0.40        # TEKO root height
+
+    yaw = torch.rand(num, device=device) * 2 * np.pi
 
     pos = torch.stack([x, y, z], dim=1)
     quat = yaw_to_quat(yaw)
     env.robot.write_root_pose_to_sim(torch.cat([pos, quat], dim=1), env_ids=env_ids)
+
 
 
 # =============================================================================

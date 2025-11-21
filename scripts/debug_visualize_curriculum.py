@@ -9,7 +9,7 @@ Debug script: visualize all curriculum stages.
     * takes one zero-action step
     * saves camera images for env 0 and 1 to PNG
 
-Run from isaaclab root (or wherever you usually run training):
+Run with:
 
 /workspace/isaaclab/_isaac_sim/python.sh \
     /workspace/teko/scripts/debug_visualize_curriculum.py
@@ -19,27 +19,32 @@ import os
 import torch
 import imageio
 
+# 1) Launch Isaac app FIRST
 from isaaclab.app import AppLauncher
+app_launcher = AppLauncher(
+        headless=False,
+        enable_cameras=True,   # <--- THIS is the key line
+    )
+app = app_launcher.app
 
+# 2) Only now import TEKO / IsaacLab stuff
 from teko.tasks.direct.teko.teko_env_cfg import TekoEnvCfg
 from teko.tasks.direct.teko.teko_env import TekoEnv
 from teko.tasks.direct.teko.curriculum.curriculum_manager import STAGE_NAMES
 
 
 def main():
-    # We want the GUI so you can also look at the scene
-    app = AppLauncher(headless=False).app
-
     # --- Configure env for debugging ---
     cfg = TekoEnvCfg()
     cfg.scene.num_envs = 2
     cfg.enable_curriculum = True
 
-    # If you add the debug flags in the cfg (see section 2):
-    # cfg.debug_boundaries = True
-    # cfg.debug_goal_halo = True
+    # If you added these flags in TekoEnvCfg:
+    # cfg.debug_boundaries = True      # red arena lines
+    # cfg.debug_goal_halo = True       # red halo around static robot
 
-    env = TekoEnv(cfg=cfg)
+    # Render with GUI
+    env = TekoEnv(cfg=cfg, render_mode="human")
 
     out_dir = os.path.join("/workspace/teko", "debug_stage_views")
     os.makedirs(out_dir, exist_ok=True)
@@ -60,18 +65,17 @@ def main():
         env.set_curriculum_level(stage)
         obs, _ = env.reset()
 
-        # One zero-action step (to let physics & camera update)
+        # One zero-action step (physics + camera update)
         zero_action = torch.zeros((num_envs, action_dim), device=env.device)
         obs, _, _, _, _ = env.step(zero_action)
 
         # Get RGB observations: [num_envs, 3, H, W] in [0, 1]
-        rgb = obs["rgb"].detach().cpu()  # tensor
+        rgb = obs["rgb"].detach().cpu()
 
         for env_id in range(num_envs):
             img = rgb[env_id]  # [3, H, W]
-            # convert back to [H, W, 3] uint8 for saving
             img = (img * 255.0).clamp(0, 255).byte()
-            img = img.permute(1, 2, 0).numpy()
+            img = img.permute(1, 2, 0).numpy()  # [H, W, 3]
 
             fname = os.path.join(
                 out_dir,
@@ -80,17 +84,9 @@ def main():
             imageio.imwrite(fname, img)
             print(f"[SAVED] {fname}")
 
-        # OPTIONAL: if you want to also save a viewport screenshot,
-        # you can plug in Isaac/Kit viewport API here (pseudo-code):
-        #
-        # import omni.kit.viewport_legacy as vp
-        # viewport = vp.get_default_viewport_window()
-        # tex = viewport.get_texture()
-        # tex.save(os.path.join(out_dir, f"stage_{stage:02d}_viewport.png"))
-
     env.close()
-    app.close()
 
 
 if __name__ == "__main__":
     main()
+    app.close()

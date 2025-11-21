@@ -1,20 +1,68 @@
 # SPDX-License-Identifier: BSD-3-Clause
-#
-# Reward functions for the TEKO environment (OPTIMIZED v6.1 - ALIGNMENT FIX)
-# ==========================================================================
-#
-# Components:
-#   1. Distance reward      – encourages being close to the docking point
-#   2. Progress reward      – rewards getting closer over time
-#   3. Alignment reward     – rear of robot aligned with goal
-#   4. Velocity penalty     – discourages excessive speed
-#   5. Oscillation penalty  – discourages jerky actions
-#   6. Collision penalty    – HUGE penalty for crashes (anti-exploit)
-#   7. Boundary penalty     – HUGE penalty for leaving arena
-#   8. Success bonus        – large bonus for successful docking
-#   9. Proximity bonus      – extra reward when very close
-#  10. Survival bonus       – per-step reward to make crashing worse than timing out
-#
+"""
+Reward functions for the TEKO environment (v6.2 – AABB / arena-consistent)
+==========================================================================
+
+This module defines the scalar reward used in the TEKO vision-based docking task.
+It decomposes the total reward into several interpretable components:
+
+1. Distance reward
+   - Uses the *connector sphere distance* in the XY plane (surface_xy).
+   - Simply penalizes being far from the docking point:  r_dist ≈ -distance.
+   - Encourages the agent to stay close to the docking interface.
+
+2. Progress reward
+   - Looks at the *change* in distance between steps.
+   - If the robot moves closer (distance_t < distance_{t-1}), reward > 0.
+   - If it moves away, reward < 0.
+   - Strongly encourages monotonic approach behavior.
+
+3. Alignment reward
+   - Uses the robot’s orientation and the vector to the goal.
+   - Measures how well the *rear* of the robot is aligned with the goal
+     (because the connector + camera are on the back).
+   - Uses cos(angular error), so perfectly aligned ≈ +0.5, opposite ≈ -0.5.
+
+4. Velocity penalty
+   - Small penalty proportional to the planar speed of the robot.
+   - Discourages driving too fast (which often leads to crashes),
+     but does not forbid moving.
+
+5. Oscillation penalty
+   - Penalizes large changes between consecutive actions.
+   - Encourages smoother control instead of twitchy, rapidly-changing commands.
+
+6. Collision penalty (connector-zone “crash”)
+   - Detects “hard hits” near the docking interface:
+       * distance < 10 cm
+       * speed > 0.3 m/s
+       * not already a successful dock
+   - Applies a large negative reward (-500) to make crashing very undesirable.
+   - Works together with the survival bonus to prevent "suicide for fast reset".
+
+7. Boundary penalty (leaving the arena)
+   - Uses the same arena limits as the environment:
+       |x_local| > arena_half_x or |y_local| > arena_half_y
+   - Applies -500 when the robot leaves the allowed region.
+   - Fully consistent with the red boundary walls.
+
+8. Success bonus
+   - When the docking connectors are within 3 cm in the XY plane,
+     the agent receives a big +100 reward.
+   - This is the main sparse “task completion” signal.
+
+9. Proximity bonus
+   - Between 3 cm and 10 cm (near but not docked), gives a small +2 bonus.
+   - Encourages reaching and staying near the docking point while it refines
+     alignment and approach.
+
+10. Survival bonus
+    - Constant +0.3 every step.
+    - Ensures that “surviving” the full episode without crashing is better
+      than crashing early (even if crashes give some early progress reward).
+
+The final reward is the sum of all components, clamped to [-500, 400].
+"""
 
 from __future__ import annotations
 import torch
@@ -49,12 +97,18 @@ def _angle_wrap(angle: torch.Tensor) -> torch.Tensor:
 
 def compute_total_reward(env) -> torch.Tensor:
     """
-    Compute balanced reward for vision-based docking.
+    Compute the scalar reward for the TEKO vision-based docking task.
+
+    Args:
+        env: TekoEnv instance (gives access to physics state and buffers)
+
+    Returns:
+        total_reward: [N] tensor of per-environment rewards
     """
     device = env.device
 
     # ------------------------------------------------------------------
-    # 0. Distance from docking spheres (our main geometric signal)
+    # 0. Distance from docking spheres (main geometric signal)
     # ------------------------------------------------------------------
     _, _, surface_xy, _ = env.get_sphere_distances_from_physics()
 
@@ -65,7 +119,8 @@ def compute_total_reward(env) -> torch.Tensor:
     # ------------------------------------------------------------------
     # 1. Distance reward (linear penalty)
     # ------------------------------------------------------------------
-    distance_reward = -surface_xy  # ~[-2, 0] in typical range
+    # Negative of the distance in XY between connector spheres.
+    distance_reward = -surface_xy
     distance_reward = torch.clamp(distance_reward, min=-10.0, max=0.0)
 
     # ------------------------------------------------------------------
@@ -83,11 +138,10 @@ def compute_total_reward(env) -> torch.Tensor:
     robot_quat = env.robot.data.root_quat_w  # [N, 4] (x, y, z, w)
     robot_yaw = _quat_to_yaw(robot_quat)     # front yaw in world frame
 
-    # Direction from robot to goal
+    # Direction from robot to goal in XY
     robot_pos = env.robot.data.root_pos_w    # [N, 3]
     goal_pos = env.goal_positions            # [N, 3]
-    vec_to_goal = goal_pos - robot_pos       # vector in XY plane
-
+    vec_to_goal = goal_pos - robot_pos
     goal_yaw = torch.atan2(vec_to_goal[:, 1], vec_to_goal[:, 0])
 
     # Rear yaw = front yaw + pi (camera + connector are at the back)
@@ -117,7 +171,7 @@ def compute_total_reward(env) -> torch.Tensor:
     env.prev_actions = env.actions.clone()
 
     # ------------------------------------------------------------------
-    # 6. Collision penalty (ANTI-EXPLOIT)
+    # 6. Collision penalty (ANTI-EXPLOIT near connector)
     # ------------------------------------------------------------------
     # "Crash" = close AND fast BUT not successfully docked
     raw_success = surface_xy < 0.03
@@ -136,9 +190,13 @@ def compute_total_reward(env) -> torch.Tensor:
     env_origins = env.scene.env_origins
     robot_pos_local = robot_pos_global - env_origins
 
+    # Use the SAME arena limits as the environment & debug walls
+    hx = float(env._arena_half_x)
+    hy = float(env._arena_half_y)
+
     out_of_bounds = (
-        (torch.abs(robot_pos_local[:, 0]) > 1.4) |
-        (torch.abs(robot_pos_local[:, 1]) > 2.4)
+        (robot_pos_local[:, 0].abs() > hx) |
+        (robot_pos_local[:, 1].abs() > hy)
     )
 
     boundary_penalty = torch.where(

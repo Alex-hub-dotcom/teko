@@ -1,16 +1,31 @@
 #!/usr/bin/env python3
 """
-TEKO - 16-STAGE ULTRA-GRADUAL CURRICULUM TRAINING
-==================================================
+TEKO - 16-STAGE ULTRA-GRADUAL CURRICULUM TRAINING (FINAL)
+=========================================================
 Author: Alexandre Schleier Neves da Silva
 Contact: alexandre.schleiernevesdasilva@uni-hohenheim.de
 
-- Vision-only PPO with pretrained MobileNetV3-Small encoder
+- Vision-only PPO with your current visual encoder (create_visual_encoder("simple", 256, True))
 - 16-stage ultra-gradual curriculum (see curriculum_manager.py)
 - 2D continuous action space [v_cmd, w_cmd] mapped to wheel torques
-- 3,000,000 steps total (default 2,000,000 via CLI)
-- 15k minimum steps per stage before checking advancement
-- 85% success rate threshold for stage advancement
+- Default 3,000,000 environment steps (can be changed via --steps)
+
+Curriculum advancement logic:
+- Per-stage minimum:          15k steps (HYPERPARAMS["min_stage_steps"])
+- Stage-dependent success thresholds:
+
+    Stage  0–2   ->  0.90   (easy, should be almost perfect)
+    Stage  3–7   ->  0.80
+    Stage  8–11  ->  0.70
+    Stage 12–15  ->  0.60
+
+- Anti-stall safety:
+    If a stage has already seen more than MAX_STAGE_STEPS (default 250k steps)
+    it will advance even if success rate is below the target threshold.
+
+This makes it *very likely* that training will eventually go through all
+stages if you run for enough steps (e.g. 3M+), while still forcing the
+policy to learn something useful at each stage.
 """
 
 import argparse
@@ -25,7 +40,7 @@ from isaaclab.app import AppLauncher
 # -----------------------------
 parser = argparse.ArgumentParser()
 parser.add_argument("--num_envs", type=int, default=16, help="Parallel environments")
-parser.add_argument("--steps", type=int, default=2_000_000, help="Total training steps")
+parser.add_argument("--steps", type=int, default=3_000_000, help="Total training steps")
 parser.add_argument("--seed", type=int, default=42, help="Random seed")
 parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
 parser.add_argument("--rollout_len", type=int, default=64, help="Rollout length")
@@ -35,7 +50,7 @@ parser.add_argument("--checkpoint", type=str, default=None,
 parser.add_argument("--batch_size", type=int, default=256, help="Minibatch size")
 AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
-args.enable_cameras = True
+args.enable_cameras = True  # important for vision-only
 
 app = AppLauncher(args)
 sim = app.app
@@ -51,14 +66,10 @@ from torch.utils.tensorboard import SummaryWriter
 
 from teko.tasks.direct.teko.teko_env import TekoEnv, TekoEnvCfg
 from teko.tasks.direct.teko.teko_brain.cnn_model import create_visual_encoder
-from teko.tasks.direct.teko.curriculum.curriculum_manager import (
-    should_advance_curriculum,
-    STAGE_NAMES,
-    set_curriculum_level,
-)
+from teko.tasks.direct.teko.curriculum.curriculum_manager import STAGE_NAMES
 
 # =============================================================================
-# Central hyperparameters (easy to tune / use with genetic optimization later)
+# Central hyperparameters
 # =============================================================================
 
 HYPERPARAMS = {
@@ -69,8 +80,26 @@ HYPERPARAMS = {
     "entropy_coef": 0.01,
     "value_coef": 0.5,
     "max_grad_norm": 0.5,
-    "min_stage_steps": 15_000,   # minimum steps in a stage before checking advance
+    "min_stage_steps": 15_000,    # minimum steps in a stage before checking advance
 }
+
+# Max steps allowed in a single stage before we *force* advancement
+MAX_STAGE_STEPS = 250_000
+
+
+def get_stage_threshold(level: int) -> float:
+    """
+    Stage-dependent success threshold.
+    Returns the success rate required to move from this stage to the next.
+    """
+    if level <= 2:
+        return 0.90   # very easy baby-forward stages -> almost perfect
+    elif level <= 7:
+        return 0.80   # offset stages
+    elif level <= 11:
+        return 0.70   # larger offsets / lateral
+    else:
+        return 0.60   # 180°, search, full autonomy
 
 
 # =============================================================================
@@ -81,10 +110,9 @@ class Policy(nn.Module):
     def __init__(self):
         super().__init__()
 
-        # Use pretrained MobileNetV3-Small encoder (ImageNet)
-        # SimpleCNN is still available in cnn_model.py if needed:
-        # self.encoder = create_visual_encoder("simple", 256, False)
-        self.encoder = create_visual_encoder("simple", 256, True)
+        # Use your existing visual encoder configuration
+        # (do not change this unless you intentionally want to)
+        self.encoder = create_visual_encoder("simple", 256, False)
 
         self.actor = nn.Sequential(
             nn.Linear(256, 128), nn.ReLU(),
@@ -138,7 +166,7 @@ def compute_gae(rewards, values, dones, gamma, lam):
     """
     T, N = rewards.shape
     advantages = torch.zeros_like(rewards)
-    last_gae = 0
+    last_gae = 0.0
 
     for t in reversed(range(T)):
         next_value = 0 if t == T - 1 else values[t + 1]
@@ -181,8 +209,9 @@ def ppo_update(policy, optimizer, obs, actions, logp_old, advantages, returns,
 
             # PPO policy loss
             ratio = (logp - logp_old_flat[mb_idx]).exp()
-            clip_adv = torch.clamp(ratio, 1 - clip_ratio, 1 + clip_ratio) * advantages_flat[mb_idx]
-            policy_loss = -torch.min(ratio * advantages_flat[mb_idx], clip_adv).mean()
+            unclipped = ratio * advantages_flat[mb_idx]
+            clipped = torch.clamp(ratio, 1 - clip_ratio, 1 + clip_ratio) * advantages_flat[mb_idx]
+            policy_loss = -torch.min(unclipped, clipped).mean()
 
             # Value loss with optional clipping
             if value_clip is not None:
@@ -217,12 +246,13 @@ def ppo_update(policy, optimizer, obs, actions, logp_old, advantages, returns,
 
 def main():
     print("\n" + "=" * 70)
-    print("🎓 TEKO - 16-STAGE ULTRA-GRADUAL CURRICULUM")
+    print("🎓 TEKO - 16-STAGE ULTRA-GRADUAL CURRICULUM (FINAL)")
     print("=" * 70)
     print(f"Environments: {args.num_envs}")
     print(f"Total steps: {args.steps:,}")
     print(f"Stages: {len(STAGE_NAMES)} (ultra-gradual)")
-    print(f"Advancement: 85% success, min {HYPERPARAMS['min_stage_steps']:,} steps/stage")
+    print(f"Advancement: stage-dependent thresholds + anti-stall, "
+          f"min {HYPERPARAMS['min_stage_steps']:,} steps/stage")
     print("=" * 70 + "\n")
 
     torch.manual_seed(args.seed)
@@ -251,8 +281,9 @@ def main():
         policy.load_state_dict(ckpt["policy"])
         optimizer.load_state_dict(ckpt["optimizer"])
         start_step = ckpt.get("step", 0)
-        env.curriculum_level = ckpt.get("curriculum_level", 0)
+        restored_level = ckpt.get("curriculum_level", 0)
         steps_in_current_stage = ckpt.get("steps_in_stage", 0)
+        env.set_curriculum_level(restored_level)
         print(f"Resumed from step {start_step}, stage {env.curriculum_level}")
 
     # ------------------------------------------------------------------
@@ -273,7 +304,7 @@ def main():
     episode_rewards = deque(maxlen=100)
     episode_lengths = deque(maxlen=100)
     episode_successes = deque(maxlen=100)
-    stage_success_window = deque(maxlen=200)
+    stage_success_window = deque(maxlen=200)   # rolling success for current stage
 
     current_episode_reward = torch.zeros(args.num_envs, device=device)
     current_episode_length = torch.zeros(args.num_envs, dtype=torch.int32, device=device)
@@ -341,11 +372,11 @@ def main():
         policy_loss, value_loss, entropy = ppo_update(
             policy,
             optimizer,
-            obs_t,
-            act_t,
-            logp_t,
-            advantages,
-            returns,
+            obs_t.to(device),
+            act_t.to(device),
+            logp_t.to(device),
+            advantages.to(device),
+            returns.to(device),
             epochs=args.epochs,
             batch_size=args.batch_size,
             clip_ratio=HYPERPARAMS["clip_ratio"],
@@ -361,29 +392,51 @@ def main():
         success_rate = np.mean(episode_successes) if episode_successes else 0.0
         stage_success = np.mean(stage_success_window) if stage_success_window else 0.0
 
+        current_stage = env.curriculum_level
+        stage_threshold = get_stage_threshold(current_stage)
+
         writer.add_scalar("train/reward",           mean_reward,   step)
         writer.add_scalar("train/episode_length",   mean_length,   step)
         writer.add_scalar("train/success_rate",     success_rate,  step)
         writer.add_scalar("train/stage_success",    stage_success, step)
-        writer.add_scalar("train/curriculum_stage", env.curriculum_level, step)
+        writer.add_scalar("train/curriculum_stage", current_stage, step)
+        writer.add_scalar("train/stage_threshold",  stage_threshold, step)
         writer.add_scalar("train/policy_loss",      policy_loss,   step)
         writer.add_scalar("train/value_loss",       value_loss,    step)
         writer.add_scalar("train/entropy",          entropy,       step)
         writer.add_scalar("train/steps_in_stage",   steps_in_current_stage, step)
 
-        print(f"[{step:7d}] S{env.curriculum_level:02d} | "
+        print(f"[{step:7d}] S{current_stage:02d} | "
               f"R={mean_reward:6.1f} | Len={mean_length:4.0f} | "
               f"SR={success_rate*100:4.1f}% | SSR={stage_success*100:4.1f}% | "
-              f"StageSteps={steps_in_current_stage:5d}")
+              f"Thr={stage_threshold*100:4.1f}% | "
+              f"StageSteps={steps_in_current_stage:6d}")
 
-        # Curriculum advancement: only after enough steps in THIS stage
+        # ------------------------------------------------------------------
+        # Curriculum advancement: stage-dependent threshold + anti-stall
+        # ------------------------------------------------------------------
         if steps_in_current_stage >= HYPERPARAMS["min_stage_steps"]:
-            if should_advance_curriculum(stage_success, env.curriculum_level):
-                set_curriculum_level(env, env.curriculum_level + 1)
-                stage_success_window.clear()
-                steps_in_current_stage = 0  # reset counter on stage change
+            advance = False
 
-        # Checkpoint every 50k steps
+            # Only trust stage_success if we have a reasonable number of episodes
+            enough_episodes = len(stage_success_window) >= 50
+
+            if enough_episodes and stage_success >= stage_threshold:
+                advance = True
+            elif steps_in_current_stage >= MAX_STAGE_STEPS:
+                # Safety valve: don't get stuck forever in one stage
+                print(f"[CURRICULUM] Forcing advance from stage {current_stage} "
+                      f"after {steps_in_current_stage} steps (SSR={stage_success:.3f})")
+                advance = True
+
+            if advance and current_stage < len(STAGE_NAMES) - 1:
+                env.set_curriculum_level(current_stage + 1)
+                stage_success_window.clear()
+                steps_in_current_stage = 0
+
+        # ------------------------------------------------------------------
+        # Checkpointing
+        # ------------------------------------------------------------------
         if step % 50_000 == 0 and step > start_step:
             ckpt_path = f"{log_dir}/ckpt_{step}.pt"
             torch.save(

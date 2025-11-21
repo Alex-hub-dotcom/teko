@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: BSD-3-Clause
 """
-TEKO Environment - 12-Stage Curriculum Compatible
-==================================================
-- Supports 12-stage curriculum (0-11)
+TEKO Environment - Curriculum Compatible
+========================================
+- Supports multi-stage curriculum
 - Nuclear penalties (-500 collision/boundary)
 - Survival bonus (+0.3/step)
 - Anti-crash exploit (min_collision_steps=10)
@@ -15,10 +15,11 @@ For questions or collaboration, feel free to contact:
 """
 
 from __future__ import annotations
+import math
 import numpy as np
 import torch
 from omni.usd import get_context
-from pxr import Sdf, UsdGeom, UsdLux, Gf
+from pxr import Sdf, UsdGeom, UsdLux, Gf, UsdPhysics
 from isaaclab.assets import Articulation
 from isaaclab.envs import DirectRLEnv
 from isaaclab.sim import SimulationContext
@@ -26,8 +27,10 @@ from isaaclab.sensors import Camera, CameraCfg
 
 from .teko_env_cfg import TekoEnvCfg
 from .rewards.reward_functions import compute_total_reward
-from .curriculum.curriculum_manager import reset_environment_curriculum, set_curriculum_level
-from .utils.geometry_utils import yaw_to_quat
+from .curriculum.curriculum_manager import (
+    reset_environment_curriculum,
+    set_curriculum_level,
+)
 from .utils.logging_utils import collect_episode_stats
 from .robots.teko_static import TEKOStatic
 
@@ -53,6 +56,16 @@ class TekoEnv(DirectRLEnv):
         # Torque scaling for the wheels
         self._max_wheel_torque = cfg.max_wheel_torque
 
+        # Arena logical half-extents (for OOB + debug walls)
+        self._arena_half_x = float(cfg.arena_half_x)
+        self._arena_half_y = float(cfg.arena_half_y)
+
+        # Rectangular body footprints (meters)
+        self._active_body_length = float(cfg.active_body_length)
+        self._active_body_width = float(cfg.active_body_width)
+        self._static_body_length = float(cfg.static_body_length)
+        self._static_body_width = float(cfg.static_body_width)
+
         # These will be initialized later
         self.actions = None
         self.dof_idx = None
@@ -61,7 +74,7 @@ class TekoEnv(DirectRLEnv):
         self.num_agents = 1
         self._polarity = None  # wheel direction (left/right) will be cached here
 
-        # Curriculum learning (12 stages: 0-11)
+        # Curriculum learning (stage index; actual logic in curriculum_manager)
         self.curriculum_level = 0
 
         # State tracking (used by reward functions)
@@ -75,9 +88,13 @@ class TekoEnv(DirectRLEnv):
         self.episode_lengths = []
         self.episode_successes = []
         self.reward_components = {
-            "distance": [], "progress": [], "alignment": [],
-            "velocity_penalty": [], "oscillation_penalty": [],
-            "collision_penalty": [], "wall_penalty": []
+            "distance": [],
+            "progress": [],
+            "alignment": [],
+            "velocity_penalty": [],
+            "oscillation_penalty": [],
+            "collision_penalty": [],
+            "wall_penalty": [],
         }
 
         # Call Isaac Lab base class constructor
@@ -114,15 +131,18 @@ class TekoEnv(DirectRLEnv):
     def _init_observation_space(self):
         """Define the observation space (here: only RGB images)."""
         import gymnasium as gym
+
         frame_shape = (3, self.cfg.camera.height, self.cfg.camera.width)
-        self.observation_space = gym.spaces.Dict({
-            "rgb": gym.spaces.Box(
-                low=0.0,
-                high=1.0,
-                shape=frame_shape,
-                dtype=np.float32,
-            )
-        })
+        self.observation_space = gym.spaces.Dict(
+            {
+                "rgb": gym.spaces.Box(
+                    low=0.0,
+                    high=1.0,
+                    shape=frame_shape,
+                    dtype=np.float32,
+                )
+            }
+        )
         print(f"[INFO] Observation space set to {frame_shape}, range [0, 1]")
 
     def _setup_global_lighting(self, stage):
@@ -141,12 +161,51 @@ class TekoEnv(DirectRLEnv):
         UsdGeom.Xformable(sun).AddRotateYOp().Set(30.0)
         print("[INFO] Global lighting setup complete.")
 
+    def _spawn_ground_plane(self, stage, env_idx: int):
+        """
+        Create a simple static ground plane inside env_{idx}.
+
+        - Centered at (0, 0, floor_z) in local env coordinates.
+        - Size matches the logical arena (±arena_half_x, ±arena_half_y).
+        - Has collision enabled via UsdPhysics.CollisionAPI.
+        """
+        env_root = f"/World/envs/env_{env_idx}"
+        ground_path = f"{env_root}/Ground"
+
+        cube = UsdGeom.Cube.Define(stage, Sdf.Path(ground_path))
+        xf = UsdGeom.Xformable(cube)
+        xf.ClearXformOpOrder()
+
+        floor_z = 0.185     # height of arena floor
+        thickness = 0.02    # 2 cm thick slab
+
+        # Place at center of env, at given Z
+        xf.AddTranslateOp().Set(Gf.Vec3d(0.0, 0.0, floor_z))
+
+        # Match arena extents
+        hx = float(self._arena_half_x)
+        hy = float(self._arena_half_y)
+        # Cube's base size is 2, so scale uses half-lengths
+        xf.AddScaleOp().Set(Gf.Vec3d(hx, hy, thickness * 0.5))
+
+        # Enable collision (static collider — no rigid body)
+        UsdPhysics.CollisionAPI.Apply(cube.GetPrim())
+
+        # Neutral color (you can hide it later if needed)
+        UsdGeom.Gprim(cube).CreateDisplayColorAttr([Gf.Vec3f(0.4, 0.4, 0.4)])
+        #UsdGeom.Gprim(cube).CreateDisplayColorAttr([Gf.Vec3f(0.2, 0.8, 0.2)]) #for debuggin use color for visual assitance
+        
+
+        print(f"[DEBUG] Spawned ground plane for env_{env_idx} at z={floor_z}")
+
     def _setup_per_environment_assets(self, stage):
         """
         For each environment (env_0, env_1, ...) we:
         - add the arena,
+        - create a dedicated ground plane,
         - position the active robot,
-        - spawn the static docking target with ArUco marker.
+        - spawn the static docking target with ArUco marker,
+        - optionally spawn debug visualization (arena boundaries, robot body boxes).
         """
         num_envs = self.scene.cfg.num_envs
         ARENA_USD_PATH = "/workspace/teko/documents/CAD/USD/stage_arena.usd"
@@ -155,12 +214,15 @@ class TekoEnv(DirectRLEnv):
         for env_idx in range(num_envs):
             env_path = f"/World/envs/env_{env_idx}"
 
-            # Arena
+            # Arena visual mesh
             try:
                 arena_prim = stage.DefinePrim(f"{env_path}/Arena", "Xform")
                 arena_prim.GetReferences().AddReference(ARENA_USD_PATH)
             except Exception as e:
                 print(f"[WARN] Arena failed for env_{env_idx}: {e}")
+
+            # Dedicated ground collider matching arena extents
+            self._spawn_ground_plane(stage, env_idx)
 
             # Active robot start pose (approximate)
             robot_prim = stage.GetPrimAtPath(f"{env_path}/Robot")
@@ -178,7 +240,15 @@ class TekoEnv(DirectRLEnv):
                 )
                 print(f"[INFO] Spawned static TEKO goal in env_{env_idx}")
             except Exception as e:
-                print(f"[WARN] Failed to create static TEKO goal in env_{env_idx}: {e}")
+                print(
+                    f"[WARN] Failed to create static TEKO goal in env_{env_idx}: {e}"
+                )
+
+            # Debug visualization: arena boundaries + robot body boxes
+            if getattr(self.cfg, "debug_boundaries", False):
+                self._spawn_arena_boundaries(stage, env_idx)
+            if getattr(self.cfg, "debug_robot_boxes", False):
+                self._spawn_robot_debug_boxes(stage, env_idx)
 
         print(f"[INFO] Created {num_envs} environments.")
 
@@ -189,7 +259,7 @@ class TekoEnv(DirectRLEnv):
                 f"/World/envs/env_{env_idx}/Robot/teko_urdf/TEKO_Body/"
                 "TEKO_WallBack/TEKO_Camera/RearCamera"
             )
-            
+
             cam_cfg = CameraCfg(
                 prim_path=cam_path,
                 update_period=0,
@@ -198,10 +268,10 @@ class TekoEnv(DirectRLEnv):
                 data_types=["rgb"],
                 spawn=None,
             )
-            
+
             camera = Camera(cfg=cam_cfg)
             self.cameras.append(camera)
-        
+
         print(f"[INFO] Initialized {len(self.cameras)} cameras.")
 
     def _cache_goal_transforms(self):
@@ -218,34 +288,153 @@ class TekoEnv(DirectRLEnv):
         print(f"[INFO] Cached {num_envs} goal positions.")
 
     # ------------------------------------------------------------------
+    # Debug visualization: arena boundaries + robot body boxes
+    # ------------------------------------------------------------------
+    def _spawn_arena_boundaries(self, stage, env_idx: int):
+        """
+        Draw thin red 'walls' at the logical arena limits used in _get_dones.
+
+        These use the same half-extents as the out-of-bounds check:
+
+            |x| > arena_half_x  -> out of bounds
+            |y| > arena_half_y  -> out of bounds
+
+        Visual-only: no rigid body, no collision.
+        """
+        env_path = f"/World/envs/env_{env_idx}/Debug"
+        stage.DefinePrim(env_path, "Xform")
+
+        hx = float(self._arena_half_x)
+        hy = float(self._arena_half_y)
+
+        def make_wall(name: str, pos, scale):
+            prim_path = f"{env_path}/{name}"
+            cube = UsdGeom.Cube.Define(stage, Sdf.Path(prim_path))
+            xf = UsdGeom.Xformable(cube)
+            xf.ClearXformOpOrder()
+            xf.AddTranslateOp().Set(Gf.Vec3d(*pos))
+            xf.AddScaleOp().Set(Gf.Vec3d(*scale))
+            UsdGeom.Gprim(cube).CreateDisplayColorAttr(
+                [Gf.Vec3f(1.0, 0.0, 0.0)]
+            )
+
+        # Slightly above ground so they are visible
+        z = 0.4
+
+        # X walls (along Y, at x = ±hx)
+        make_wall(
+            "Boundary_Xmin",
+            pos=(-hx, 0.0, z),
+            scale=(0.02, 2.0 * hy, 0.01),
+        )
+        make_wall(
+            "Boundary_Xmax",
+            pos=(hx, 0.0, z),
+            scale=(0.02, 2.0 * hy, 0.01),
+        )
+
+        # Y walls (along X, at y = ±hy)
+        make_wall(
+            "Boundary_Ymin",
+            pos=(0.0, -hy, z),
+            scale=(2.0 * hx, 0.02, 0.01),
+        )
+        make_wall(
+            "Boundary_Ymax",
+            pos=(0.0, hy, z),
+            scale=(2.0 * hx, 0.02, 0.01),
+        )
+
+        print(f"[DEBUG] Spawned arena boundaries for env_{env_idx}")
+
+    def _spawn_robot_debug_boxes(self, stage, env_idx: int):
+        """
+        Attach rectangular debug boxes to TEKO_Body of active/static robots.
+        """
+        env_root = f"/World/envs/env_{env_idx}"
+        active_root = f"{env_root}/Robot/teko_urdf/TEKO_Body"
+        static_root = f"{env_root}/RobotGoal/teko_urdf/TEKO_Body"
+
+        # Active robot box (green)
+        self._make_debug_box(
+            stage=stage,
+            parent_path=active_root,
+            name="DebugChassisActive",
+            length=self._active_body_length,
+            width=self._active_body_width,
+            color=Gf.Vec3f(0.0, 1.0, 0.0),
+        )
+
+        # Static robot box (red)
+        self._make_debug_box(
+            stage=stage,
+            parent_path=static_root,
+            name="DebugChassisStatic",
+            length=self._static_body_length,
+            width=self._static_body_width,
+            color=Gf.Vec3f(1.0, 0.0, 0.0),
+        )
+
+        print(f"[DEBUG] Spawned robot debug boxes for env_{env_idx}")
+
+    def _make_debug_box(
+        self,
+        stage,
+        parent_path: str,
+        name: str,
+        length: float,
+        width: float,
+        color: Gf.Vec3f,
+    ):
+        """
+        Helper to create a thin rectangular box (footprint) attached
+        to a given parent prim (Robot or RobotGoal).
+        """
+        box_path = f"{parent_path}/{name}"
+        cube = UsdGeom.Cube.Define(stage, Sdf.Path(box_path))
+        xf = UsdGeom.Xformable(cube)
+        xf.ClearXformOpOrder()
+
+        # Local center at (0, 0, z); we keep it low, close to chassis
+        z_local = 0.05
+        xf.AddTranslateOp().Set(Gf.Vec3d(0.0, 0.0, z_local))
+
+        # UsdGeom.Cube has size 2 by default, so scale is half-lengths
+        half_len = 0.5 * float(length)
+        half_wid = 0.5 * float(width)
+        xf.AddScaleOp().Set(Gf.Vec3d(half_len, half_wid, 0.01))
+
+        UsdGeom.Gprim(cube).CreateDisplayColorAttr([color])
+
+    # ------------------------------------------------------------------
     # Sphere position computation (docking measurement)
     # ------------------------------------------------------------------
     def get_sphere_distances_from_physics(self):
         """
         Compute the distance between the male/female connector spheres.
-
-        We use these spheres instead of chassis distance because
-        they represent the actual docking interface.
         """
         FEMALE_OFFSET = torch.tensor([0.24, 0.0, -0.08], device=self.device)
         MALE_OFFSET = torch.tensor([0.22667, -0.00144, -0.08815], device=self.device)
 
         active_pos = self.robot.data.root_pos_w
         static_pos = self.goal_positions
-        
-        female_pos = active_pos + FEMALE_OFFSET.unsqueeze(0).expand(active_pos.shape[0], 3)
-        male_pos = static_pos + MALE_OFFSET.unsqueeze(0).expand(static_pos.shape[0], 3)
-        
+
+        female_pos = active_pos + FEMALE_OFFSET.unsqueeze(0).expand(
+            active_pos.shape[0], 3
+        )
+        male_pos = static_pos + MALE_OFFSET.unsqueeze(0).expand(
+            static_pos.shape[0], 3
+        )
+
         diff = female_pos - male_pos
         dist_3d = torch.norm(diff, dim=-1)
         dist_xy = torch.norm(diff[:, :2], dim=-1)
-        
+
         R_FEMALE = 0.005
         R_MALE = 0.005
-        # Surface distance = distance between sphere surfaces (0 means touching)
         surface_3d = torch.clamp(dist_3d - (R_FEMALE + R_MALE), min=0.0)
         surface_xy = torch.clamp(dist_xy - (R_FEMALE + R_MALE), min=0.0)
-        
+
         return female_pos, male_pos, surface_xy, surface_3d
 
     # ------------------------------------------------------------------
@@ -254,9 +443,6 @@ class TekoEnv(DirectRLEnv):
     def _lazy_init_articulation(self):
         """
         Initialize joint indices once we know the robot is fully loaded.
-
-        This looks up the wheel joint indices by name and also creates
-        a polarity tensor to handle left/right sign differences.
         """
         if self.dof_idx is not None or getattr(self.robot, "root_physx_view", None) is None:
             return
@@ -265,7 +451,9 @@ class TekoEnv(DirectRLEnv):
         name_to_idx = {n: i for i, n in enumerate(self.robot.joint_names)}
         indices = [name_to_idx[n] for n in self.cfg.dof_names if n in name_to_idx]
         if not indices:
-            raise RuntimeError(f"No valid DOF names found: {self.robot.joint_names}")
+            raise RuntimeError(
+                f"No valid DOF names found: {self.robot.joint_names}"
+            )
         self.dof_idx = torch.tensor(indices, dtype=torch.long, device=self.device)
         print(f"[INFO] DOF indices: {self.dof_idx}")
 
@@ -287,9 +475,6 @@ class TekoEnv(DirectRLEnv):
         Action space: [v_cmd, w_cmd] in [-1, 1]
           v_cmd -> forward/backward command
           w_cmd -> turning command
-
-        These are mapped to left/right wheel torques using a simple
-        differential-drive model (v ± k * w).
         """
         if self.dof_idx is None or self.actions is None:
             return
@@ -297,29 +482,29 @@ class TekoEnv(DirectRLEnv):
         num_envs = self.scene.cfg.num_envs
 
         # actions in [-1, 1]: [v_cmd, w_cmd]
-        v_cmd = self.actions[:, 0]  # forward/back command
-        w_cmd = self.actions[:, 1]  # turn command
+        v_cmd = self.actions[:, 0]
+        w_cmd = self.actions[:, 1]
 
         # Scaling factors for linear and angular commands
-        v_max = 1.0  # can be tuned
-        w_max = 1.0  # can be tuned
+        v_max = 1.0
+        w_max = 1.0
 
         v = v_cmd * v_max
         w = w_cmd * w_max
 
         # Differential-drive mapping: left/right from linear + angular components
-        k = 0.5  # turning gain, can be tuned
-        left  = v - k * w
+        k = 0.5
+        left = v - k * w
         right = v + k * w
 
         # Clamp before torque scaling so we stay in [-1, 1]
-        left  = torch.clamp(left,  -1.0, 1.0)
+        left = torch.clamp(left, -1.0, 1.0)
         right = torch.clamp(right, -1.0, 1.0)
 
         # [FL, FR, BL, BR] torques (before polarity)
-        torque_targets = torch.stack(
-            [left, right, left, right], dim=1
-        ) * self._max_wheel_torque
+        torque_targets = (
+            torch.stack([left, right, left, right], dim=1) * self._max_wheel_torque
+        )
 
         # Apply wheel polarity (handles opposite rotation directions)
         torque_targets = torque_targets * self._polarity
@@ -338,35 +523,36 @@ class TekoEnv(DirectRLEnv):
         a tensor of shape [num_envs, 3, H, W] in [0, 1].
         """
         import torch.nn.functional as F
+
         num_envs = self.scene.cfg.num_envs
         h, w = self._cam_res[1], self._cam_res[0]
         rgb_obs = torch.zeros((num_envs, 3, h, w), device=self.device)
 
         for env_idx, cam in enumerate(self.cameras):
             cam.update(dt=0.0)
-            
+
             rgb_data = cam.data.output["rgb"]
             if rgb_data is not None and rgb_data.numel() > 0:
                 # Isaac Lab sometimes returns [1, H, W, C]
                 if rgb_data.ndim == 4:
                     rgb_data = rgb_data.squeeze(0)
-                
+
                 # Drop alpha channel if present (RGBA -> RGB)
                 if rgb_data.shape[-1] == 4:
                     rgb_data = rgb_data[..., :3]
-                
+
                 # Convert to [C, H, W] and normalize to [0, 1]
                 rgb = rgb_data.permute(2, 0, 1).float() / 255.0
-                
+
                 # Make sure resolution is exactly (H, W)
                 if rgb.shape[1] != h or rgb.shape[2] != w:
                     rgb = F.interpolate(
                         rgb.unsqueeze(0),
                         size=(h, w),
                         mode="bilinear",
-                        align_corners=False
+                        align_corners=False,
                     ).squeeze(0)
-                
+
                 rgb_obs[env_idx] = rgb
 
         return {"rgb": rgb_obs}
@@ -388,7 +574,7 @@ class TekoEnv(DirectRLEnv):
         Episode ends when:
         - docking success is achieved,
         - robot leaves the allowed arena (out of bounds),
-        - a high-speed collision near the goal occurs,
+        - a high-speed chassis collision (AABB overlap) occurs,
         - or the max episode length is reached.
         """
         _, _, surface_xy, _ = self.get_sphere_distances_from_physics()
@@ -403,26 +589,59 @@ class TekoEnv(DirectRLEnv):
         # Only count success as terminal after a few steps
         success = raw_success & (self.episode_length_buf >= min_success_steps)
 
+        # ------------------------------------------------------------------
         # OUT OF BOUNDS (-500 penalty in rewards)
+        # ------------------------------------------------------------------
         robot_pos_global = self.robot.data.root_pos_w
         env_origins = self.scene.env_origins
         robot_pos_local = robot_pos_global - env_origins
+
+        hx = float(self._arena_half_x)
+        hy = float(self._arena_half_y)
+
         out_of_bounds = (
-            (torch.abs(robot_pos_local[:, 0]) > 1.4) |
-            (torch.abs(robot_pos_local[:, 1]) > 2.4)
+            (robot_pos_local[:, 0].abs() > hx) |
+            (robot_pos_local[:, 1].abs() > hy)
         )
 
-        # COLLISION (-500 penalty in rewards)
+        # ------------------------------------------------------------------
+        # STATIC BODY COLLISION (AABB vs AABB, high speed)
+        # ------------------------------------------------------------------
         lin_vel = self.robot.data.root_lin_vel_w
         speed = torch.norm(lin_vel[:, :2], dim=-1)
+
+        # Static robot root positions (global)
+        static_root_pos = self.goal_positions
+
+        # Active center relative to static center (env axes)
+        diff = robot_pos_global - static_root_pos
+        dx = diff[:, 0]
+        dy = diff[:, 1]
+
+        # Static robot box half-sizes
+        static_half_len = 0.5 * self._static_body_length
+        static_half_wid = 0.5 * self._static_body_width
+
+        # Active robot box half-sizes
+        active_half_len = 0.5 * self._active_body_length
+        active_half_wid = 0.5 * self._active_body_width
+
+        # AABB overlap in XY (axis-aligned boxes)
+        boxes_overlap = (
+            (dx.abs() < (static_half_len + active_half_len)) &
+            (dy.abs() < (static_half_wid + active_half_wid))
+        )
+
         collision = (
-            (surface_xy < 0.10) &
+            boxes_overlap &
             (speed > 0.4) &
             ~raw_success &
             (self.episode_length_buf >= min_collision_steps)
         )
 
+        # ------------------------------------------------------------------
         # Termination & timeout
+        # ------------------------------------------------------------------
         terminated = success | out_of_bounds | collision
         time_out = self.episode_length_buf >= self.max_episode_length
 
@@ -452,7 +671,9 @@ class TekoEnv(DirectRLEnv):
         if self.prev_actions is None:
             self.prev_actions = torch.zeros((num_envs, 2), device=self.device)
         if self.step_count is None:
-            self.step_count = torch.zeros(num_envs, dtype=torch.int32, device=self.device)
+            self.step_count = torch.zeros(
+                num_envs, dtype=torch.int32, device=self.device
+            )
 
         # Reset per-episode state
         self.prev_actions[env_ids] = 0.0
@@ -466,7 +687,7 @@ class TekoEnv(DirectRLEnv):
         self.prev_distance[env_ids] = surface_xy[env_ids]
 
     def set_curriculum_level(self, level: int):
-        """Set curriculum level (0-11)."""
+        """Set curriculum level."""
         set_curriculum_level(self, level)
 
     def get_episode_statistics(self):
